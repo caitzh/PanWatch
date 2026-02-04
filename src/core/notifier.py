@@ -354,7 +354,18 @@ class NotifierManager:
             parts = []
             current_part = ""
             for line in lines:
-                if len(current_part) + len(line) + 1 > MAX_LENGTH - 10:
+                # 如果单行本身就超过限制，需要对其进行切割
+                if len(line) > MAX_LENGTH - 10:
+                    # 先保存当前part
+                    if current_part:
+                        parts.append(current_part + "\n...")
+                        current_part = ""
+                    # 对超长行进行切割
+                    while len(line) > MAX_LENGTH - 10:
+                        parts.append(line[:MAX_LENGTH - 10] + "\n...")
+                        line = line[MAX_LENGTH - 10:]
+                    current_part = line
+                elif len(current_part) + len(line) + 1 > MAX_LENGTH - 10:
                     parts.append(current_part + "\n...")
                     current_part = line
                 else:
@@ -367,6 +378,7 @@ class NotifierManager:
                 if i > 0:
                     part = "(续)\n" + part
                 payload = {"msgtype": "markdown", "markdown": {"content": part}}
+                logger.debug(f"企业微信发送第 {i+1}/{len(parts)} 条消息，长度: {len(part)} 字符")
                 resp = await client.post(url, json=payload, timeout=30)
                 data = resp.json()
                 if data.get("errcode") != 0:
