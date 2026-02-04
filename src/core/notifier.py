@@ -346,6 +346,10 @@ class NotifierManager:
 
         # 企业微信 markdown 内容限制 4096 字符，超出则分批发送
         MAX_LENGTH = 4096
+        # 为"(续)"前缀预留空间
+        CONTINUE_PREFIX = "(续)\n"
+        SAFE_LENGTH = MAX_LENGTH - len(CONTINUE_PREFIX) - 20
+        
         if len(text) <= MAX_LENGTH:
             parts = [text]
         else:
@@ -355,30 +359,31 @@ class NotifierManager:
             current_part = ""
             for line in lines:
                 # 如果单行本身就超过限制，需要对其进行切割
-                if len(line) > MAX_LENGTH - 10:
+                if len(line) > SAFE_LENGTH:
                     # 先保存当前part
                     if current_part:
-                        parts.append(current_part + "\n...")
+                        parts.append(current_part)
                         current_part = ""
                     # 对超长行进行切割
-                    while len(line) > MAX_LENGTH - 10:
-                        parts.append(line[:MAX_LENGTH - 10] + "\n...")
-                        line = line[MAX_LENGTH - 10:]
+                    while len(line) > SAFE_LENGTH:
+                        parts.append(line[:SAFE_LENGTH])
+                        line = line[SAFE_LENGTH:]
                     current_part = line
-                elif len(current_part) + len(line) + 1 > MAX_LENGTH - 10:
-                    parts.append(current_part + "\n...")
+                elif len(current_part) + len(line) + 1 > SAFE_LENGTH:
+                    parts.append(current_part)
                     current_part = line
                 else:
                     current_part = current_part + "\n" + line if current_part else line
             if current_part:
                 parts.append(current_part)
 
+        logger.info(f"企业微信消息总长度 {len(text)} 字符，分为 {len(parts)} 条发送")
         async with httpx.AsyncClient() as client:
             for i, part in enumerate(parts):
                 if i > 0:
-                    part = "(续)\n" + part
+                    part = CONTINUE_PREFIX + part
                 payload = {"msgtype": "markdown", "markdown": {"content": part}}
-                logger.debug(f"企业微信发送第 {i+1}/{len(parts)} 条消息，长度: {len(part)} 字符")
+                logger.info(f"企业微信发送第 {i+1}/{len(parts)} 条消息，长度: {len(part)} 字符")
                 resp = await client.post(url, json=payload, timeout=30)
                 data = resp.json()
                 if data.get("errcode") != 0:
