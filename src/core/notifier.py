@@ -343,14 +343,35 @@ class NotifierManager:
 
         url = f"https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key={key}"
         text = f"## {title}\n\n{content}" if title else content
-        payload = {"msgtype": "markdown", "markdown": {"content": text}}
+
+        # 企业微信 markdown 内容限制 4096 字符，超出则分批发送
+        MAX_LENGTH = 4096
+        if len(text) <= MAX_LENGTH:
+            parts = [text]
+        else:
+            # 按行分割，尽量在完整行处分割
+            lines = text.split('\n')
+            parts = []
+            current_part = ""
+            for line in lines:
+                if len(current_part) + len(line) + 1 > MAX_LENGTH - 10:
+                    parts.append(current_part + "\n...")
+                    current_part = line
+                else:
+                    current_part = current_part + "\n" + line if current_part else line
+            if current_part:
+                parts.append(current_part)
 
         async with httpx.AsyncClient() as client:
-            resp = await client.post(url, json=payload, timeout=30)
-            data = resp.json()
-            if data.get("errcode") != 0:
-                raise RuntimeError(f"企业微信发送失败: {data.get('errmsg')}")
-            logger.info(f"企业微信通知发送成功: {title}")
+            for i, part in enumerate(parts):
+                if i > 0:
+                    part = "(续)\n" + part
+                payload = {"msgtype": "markdown", "markdown": {"content": part}}
+                resp = await client.post(url, json=payload, timeout=30)
+                data = resp.json()
+                if data.get("errcode") != 0:
+                    raise RuntimeError(f"企业微信发送失败: {data.get('errmsg')}")
+            logger.info(f"企业微信通知发送成功: {title} (共{len(parts)}条消息)")
 
     async def _send_serverchan(self, config: dict, title: str, content: str):
         """Server酱推送"""

@@ -1123,7 +1123,7 @@ export default function StockDetailPage() {
                     title="点击查看全部建议"
                   >
                     <div className="flex items-center justify-between gap-2">
-                      <SuggestionBadge suggestion={latest} stockName={resolvedName} stockSymbol={symbol} />
+                      <SuggestionBadge suggestion={latest} stockName={resolvedName} stockSymbol={symbol} kline={klineSummary as any} hasPosition={hasPosition} />
                       <span className="text-[10px] text-muted-foreground">{latest.created_at ? formatTime(latest.created_at) : ''}</span>
                     </div>
                     {(latest.reason || latest.signal) && (

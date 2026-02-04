@@ -126,6 +126,11 @@ interface QuoteResponse {
   market: string
   current_price: number | null
   change_pct: number | null
+  open_price?: number | null
+  high_price?: number | null
+  low_price?: number | null
+  volume?: number | null
+  turnover?: number | null
 }
 
 type QuoteMap = Record<string, { current_price: number | null; change_pct: number | null }>
@@ -275,14 +280,14 @@ export default function DashboardPage() {
     }
   }, [])
 
-  // 自选股加载后自动获取监控数据
+  // 自选股加载后只从建议池读取已有分析结果，不自动调用AI分析
   const initialScanDone = useRef(false)
   useEffect(() => {
-    if (hasWatchlist && !initialScanDone.current) {
+    if (stocks.length > 0 && !initialScanDone.current) {
       initialScanDone.current = true
-      scanAlerts()
+      loadMonitorFromPool() // 只从建议池加载已有数据，不调用AI分析
     }
-  }, [hasWatchlist])
+  }, [stocks])
 
   const loadIndices = async () => {
     setIndicesLoading(true)
@@ -434,6 +439,75 @@ export default function DashboardPage() {
       setInsightsLoading(false)
     }
   }
+
+  // 从建议池加载监控数据（快速显示）
+  const loadMonitorFromPool = useCallback(async () => {
+    const watchlistStocks = stocks.filter(s => s.enabled)
+    if (watchlistStocks.length === 0) return
+
+    setScanning(true)
+    try {
+
+      // 获取所有最新建议（返回格式: {symbol: suggestion}）
+      const symbols = watchlistStocks.map(s => s.symbol).join(',')
+      const suggestionsDict = await fetchAPI<Record<string, any>>(`/suggestions?symbols=${encodeURIComponent(symbols)}`)
+
+      // 获取实时行情
+      const quotesRes = await fetchAPI<QuoteResponse[]>('/quotes/batch', {
+        method: 'POST',
+        body: JSON.stringify({ items: watchlistStocks.map(s => ({ symbol: s.symbol, market: s.market })) }),
+      })
+      const quotesMap: Record<string, QuoteResponse> = {}
+      for (const q of quotesRes || []) {
+        quotesMap[`${q.market}:${q.symbol}`] = q
+      }
+
+      // suggestionsDict 是 {symbol: suggestion} 格式
+      const stockSuggestions: Record<string, any> = suggestionsDict || {}
+
+      const monitorData: MonitorStock[] = watchlistStocks.map(stock => {
+        const quote = quotesMap[`${stock.market}:${stock.symbol}`]
+        const sug = stockSuggestions[stock.symbol]
+        const change_pct = quote?.change_pct || 0
+
+        return {
+          symbol: stock.symbol,
+          name: stock.name,
+          market: stock.market,
+          current_price: quote?.current_price || 0,
+          change_pct: change_pct,
+          open_price: quote?.open_price || null,
+          high_price: quote?.high_price || null,
+          low_price: quote?.low_price || null,
+          volume: quote?.volume || null,
+          turnover: quote?.turnover || null,
+          alert_type: Math.abs(change_pct) >= 3 ? (change_pct > 0 ? '急涨' : '急跌') : null,
+          has_position: false,
+          cost_price: null,
+          pnl_pct: null,
+          trading_style: null,
+          kline: null,
+          suggestion: sug ? {
+            action: sug.action,
+            action_label: sug.action_label,
+            signal: sug.signal,
+            reason: sug.reason,
+            should_alert: sug.should_alert,
+            agent_name: sug.agent_name,
+            agent_label: sug.agent_label,
+            created_at: sug.created_at,
+            is_expired: sug.is_expired,
+          } : null,
+        }
+      })
+
+      setMonitorStocks(monitorData)
+    } catch (e) {
+      console.error('从建议池加载失败:', e)
+    } finally {
+      setScanning(false)
+    }
+  }, [stocks])
 
   const scanAlerts = useCallback(async () => {
     if (!hasWatchlist) return
