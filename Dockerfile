@@ -2,7 +2,7 @@
 # 多阶段构建，减小最终镜像大小
 
 # ===== Stage 1: 前端构建 =====
-FROM node:20-alpine AS frontend-builder
+FROM swr.cn-north-4.myhuaweicloud.com/ddn-k8s/docker.io/library/node:20-alpine AS frontend-builder
 
 WORKDIR /app/frontend
 
@@ -21,7 +21,7 @@ RUN pnpm build
 
 
 # ===== Stage 2: Python 运行环境 =====
-FROM python:3.11-slim
+FROM swr.cn-north-4.myhuaweicloud.com/ddn-k8s/docker.io/library/python:3.11-slim
 
 # 版本号（构建时传入）
 ARG VERSION=dev
@@ -61,8 +61,10 @@ COPY requirements.txt ./
 # 安装 Python 依赖
 RUN pip install --no-cache-dir -r requirements.txt
 
-# 注意: Playwright 浏览器将在首次启动时自动安装到 data 目录
-# 这样可以减小镜像体积，并支持跨版本持久化
+# 安装 Playwright 浏览器（在构建时下载，避免运行时下载失败）
+RUN playwright install chromium
+
+# 注意: Playwright 浏览器已打包到镜像中
 
 # 复制后端代码
 COPY src/ ./src/

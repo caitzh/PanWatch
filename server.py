@@ -77,7 +77,7 @@ def setup_logging():
 def setup_playwright():
     """检查并安装 Playwright 浏览器
 
-    本地开发时使用系统安装的 Playwright，Docker 环境下安装到 data 目录。
+    本地开发时使用系统安装的 Playwright，Docker 环境下优先使用镜像内置的浏览器。
     通过 DOCKER 环境变量或显式设置的 PLAYWRIGHT_BROWSERS_PATH 来判断。
     """
     import subprocess
@@ -86,8 +86,21 @@ def setup_playwright():
     if "PLAYWRIGHT_BROWSERS_PATH" in os.environ:
         browser_dir = os.environ["PLAYWRIGHT_BROWSERS_PATH"]
         logger.info(f"使用自定义 Playwright 路径: {browser_dir}")
-    # Docker 环境下安装到 data 目录
+    # Docker 环境下优先检查镜像内置路径
     elif os.environ.get("DOCKER") == "1":
+        # 先检查镜像内置路径
+        system_browser_dir = "/root/.cache/ms-playwright"
+        if os.path.exists(system_browser_dir):
+            try:
+                dirs = os.listdir(system_browser_dir)
+                if any(d.startswith("chromium") for d in dirs if os.path.isdir(os.path.join(system_browser_dir, d))):
+                    logger.info(f"Docker 环境，使用镜像内置 Playwright: {system_browser_dir}")
+                    os.environ["PLAYWRIGHT_BROWSERS_PATH"] = system_browser_dir
+                    return
+            except Exception:
+                pass
+        
+        # 如果没有内置浏览器，使用 data 目录
         data_dir = os.environ.get("DATA_DIR", "./data")
         browser_dir = os.path.join(data_dir, "playwright")
         os.environ["PLAYWRIGHT_BROWSERS_PATH"] = browser_dir
