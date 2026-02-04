@@ -344,46 +344,73 @@ class NotifierManager:
         url = f"https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key={key}"
         text = f"## {title}\n\n{content}" if title else content
 
-        # 企业微信 markdown 内容限制 4096 字符，超出则分批发送
-        MAX_LENGTH = 4096
+        # 企业微信 markdown 内容限制 4096 字节（UTF-8编码），超出则分批发送
+        MAX_BYTES = 4096
         # 为"(续)"前缀预留空间
         CONTINUE_PREFIX = "(续)\n"
-        SAFE_LENGTH = MAX_LENGTH - len(CONTINUE_PREFIX) - 20
+        SAFE_BYTES = MAX_BYTES - len(CONTINUE_PREFIX.encode('utf-8')) - 100  # 预留100字节安全边界
         
-        if len(text) <= MAX_LENGTH:
+        text_bytes = len(text.encode('utf-8'))
+        if text_bytes <= MAX_BYTES:
             parts = [text]
         else:
             # 按行分割，尽量在完整行处分割
             lines = text.split('\n')
             parts = []
             current_part = ""
+            current_bytes = 0
+            
             for line in lines:
+                line_bytes = len(line.encode('utf-8'))
+                newline_bytes = 1  # '\n' 占1字节
+                
                 # 如果单行本身就超过限制，需要对其进行切割
-                if len(line) > SAFE_LENGTH:
+                if line_bytes > SAFE_BYTES:
                     # 先保存当前part
                     if current_part:
                         parts.append(current_part)
                         current_part = ""
-                    # 对超长行进行切割
-                    while len(line) > SAFE_LENGTH:
-                        parts.append(line[:SAFE_LENGTH])
-                        line = line[SAFE_LENGTH:]
+                        current_bytes = 0
+                    
+                    # 对超长行按字节切割
+                    while len(line.encode('utf-8')) > SAFE_BYTES:
+                        # 二分查找合适的切分点
+                        left, right = 0, len(line)
+                        while left < right:
+                            mid = (left + right + 1) // 2
+                            if len(line[:mid].encode('utf-8')) <= SAFE_BYTES:
+                                left = mid
+                            else:
+                                right = mid - 1
+                        parts.append(line[:left])
+                        line = line[left:]
                     current_part = line
-                elif len(current_part) + len(line) + 1 > SAFE_LENGTH:
+                    current_bytes = len(line.encode('utf-8'))
+                elif current_bytes + line_bytes + newline_bytes > SAFE_BYTES:
+                    # 当前part放不下这一行，开始新的part
                     parts.append(current_part)
                     current_part = line
+                    current_bytes = line_bytes
                 else:
-                    current_part = current_part + "\n" + line if current_part else line
+                    # 累加到当前part
+                    if current_part:
+                        current_part = current_part + "\n" + line
+                        current_bytes += newline_bytes + line_bytes
+                    else:
+                        current_part = line
+                        current_bytes = line_bytes
+                        
             if current_part:
                 parts.append(current_part)
 
-        logger.info(f"企业微信消息总长度 {len(text)} 字符，分为 {len(parts)} 条发送")
+        logger.info(f"企业微信消息总长度 {len(text)} 字符 / {text_bytes} 字节，分为 {len(parts)} 条发送")
         async with httpx.AsyncClient() as client:
             for i, part in enumerate(parts):
                 if i > 0:
                     part = CONTINUE_PREFIX + part
+                part_bytes = len(part.encode('utf-8'))
                 payload = {"msgtype": "markdown", "markdown": {"content": part}}
-                logger.info(f"企业微信发送第 {i+1}/{len(parts)} 条消息，长度: {len(part)} 字符")
+                logger.info(f"企业微信发送第 {i+1}/{len(parts)} 条消息，长度: {len(part)} 字符 / {part_bytes} 字节")
                 resp = await client.post(url, json=payload, timeout=30)
                 data = resp.json()
                 if data.get("errcode") != 0:
