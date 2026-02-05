@@ -172,7 +172,7 @@ class NewsDigestAgent(BaseAgent):
             if position:
                 lines.append(f"- {stock.name}({stock.symbol}) [持仓{position['total_quantity']}股]")
             else:
-                lines.append(f"- {stock.name}({stock.symbol})")
+                lines.append(f"- {stock.name}({stock.symbol}) [未持仓]")
 
         # 自选股相关新闻
         related_news: list[NewsItem] = data.get("related_news", [])
@@ -242,7 +242,8 @@ class NewsDigestAgent(BaseAgent):
                 symbol_map[f"{sym}.HK"] = sym
 
             if getattr(s, "market", None) == MarketCode.CN and sym.isdigit() and len(sym) == 6:
-                prefix = "SH" if sym.startswith("6") or sym.startswith("000") else "SZ"
+                # 判断市场：6/9开头→上交所SH，0/1/2/3开头→深交所SZ
+                prefix = "SH" if sym.startswith(("6", "9")) else "SZ"
                 symbol_map[f"{prefix}{sym}"] = sym
                 symbol_map[f"{sym}.{prefix}"] = sym
 

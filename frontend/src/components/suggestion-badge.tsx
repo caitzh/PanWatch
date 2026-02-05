@@ -184,35 +184,45 @@ export function SuggestionBadge({
     const aiLabel = normalized ? (actionLabels[normalized] || suggestion.action_label) : (suggestion.action_label || '观望')
     const tech = kline ? buildKlineSuggestion(kline as any, hasPosition) : null
     const techColor = tech ? (actionColors[tech.action] || 'bg-slate-500 text-white') : 'bg-slate-500 text-white'
+    const timeStr = formatSuggestionTime(suggestion.created_at)
     return (
       <>
         <div className="pt-3 border-t border-border/30">
           <div className="flex items-start gap-3">
-            <div className="shrink-0 flex items-center gap-2">
-              <button
-                onClick={(e) => {
-                  e.stopPropagation()
-                  if (suggestion.agent_label === '技术指标') setKlineDialogOpen(true)
-                  else setDialogOpen(true)
-                }}
-                className={`relative text-[13px] px-3 py-1.5 rounded font-medium hover:opacity-80 transition-opacity whitespace-nowrap ${colorClass} ${suggestion.is_expired ? 'opacity-50' : ''}`}
-                title="点击查看建议详情"
-              >
-                {aiLabel}
-                {isAI && (
-                  <span className="pointer-events-none absolute top-0 left-0 transform -translate-x-1/2 -translate-y-1/2 text-[10px] leading-none px-1.5 py-[2px] rounded-sm bg-primary text-white uppercase shadow-sm ring-1 ring-black/20">
-                    AI
-                  </span>
-                )}
-              </button>
-              {isAI && (
+            <div className="shrink-0 flex flex-col gap-2">
+              <div className="flex items-center gap-2">
                 <button
-                  onClick={(e) => { e.stopPropagation(); setKlineDialogOpen(true) }}
-                  className={`text-[13px] px-3 py-1.5 rounded font-medium hover:opacity-80 transition-opacity ${techColor}`}
-                  title="点击查看技术面详情"
+                  onClick={(e) => {
+                    e.stopPropagation()
+                    if (suggestion.agent_label === '技术指标') setKlineDialogOpen(true)
+                    else setDialogOpen(true)
+                  }}
+                  className={`relative text-[13px] px-3 py-1.5 rounded font-medium hover:opacity-80 transition-opacity whitespace-nowrap ${colorClass} ${suggestion.is_expired ? 'opacity-50' : ''}`}
+                  title="点击查看建议详情"
                 >
-                  {tech ? tech.action_label : '观望'}
+                  {aiLabel}
+                  {isAI && (
+                    <span className="pointer-events-none absolute top-0 left-0 transform -translate-x-1/2 -translate-y-1/2 text-[10px] leading-none px-1.5 py-[2px] rounded-sm bg-primary text-white uppercase shadow-sm ring-1 ring-black/20">
+                      AI
+                    </span>
+                  )}
                 </button>
+                {isAI && (
+                  <button
+                    onClick={(e) => { e.stopPropagation(); setKlineDialogOpen(true) }}
+                    className={`text-[13px] px-3 py-1.5 rounded font-medium hover:opacity-80 transition-opacity ${techColor}`}
+                    title="点击查看技术面详情"
+                  >
+                    {tech ? tech.action_label : '观望'}
+                  </button>
+                )}
+              </div>
+              {/* 来源和时间（显示在按钮下方）*/}
+              {isAI && (
+                <div className="text-[10px] text-muted-foreground/70">
+                  来源: {suggestion.agent_label || 'AI'}{timeStr && ` · ${timeStr}`}
+                  {suggestion.is_expired && <span className="ml-1 text-amber-600">(已过期)</span>}
+                </div>
               )}
             </div>
             <div className="flex-1 min-w-0">

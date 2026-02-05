@@ -353,13 +353,6 @@ class IntradayMonitorAgent(BaseAgent):
             result["action_label"] = "持有"
             return result
 
-        # 提取建议类型（从全文搜索）
-        for label, action in SUGGESTION_TYPES.items():
-            if label in content:
-                result["action"] = action
-                result["action_label"] = label
-                break
-
         # 提取信号（支持多种格式）
         signal_patterns = [
             r"「信号」\s*[:：]?\s*(.+?)(?=「|$|\n\n)",
@@ -378,21 +371,22 @@ class IntradayMonitorAgent(BaseAgent):
             r"\*\*建议\*\*\s*[:：]?\s*(.+?)(?=\*\*|$|\n\n)",
             r"建议\s*[:：]\s*(.+?)(?=\n|$)",
         ]
+        suggestion_text = ""
         for pattern in suggest_patterns:
             match = re.search(pattern, content, re.DOTALL)
             if match:
-                suggest_text = match.group(1).strip()
-                # 从建议中提取操作类型
-                for label, action in SUGGESTION_TYPES.items():
-                    if label in suggest_text:
-                        result["action"] = action
-                        result["action_label"] = label
-                        break
-                # 如果信号为空，使用建议内容作为信号
-                if not result["signal"]:
-                    result["signal"] = suggest_text[:50]
+                suggestion_text = match.group(1).strip()
                 break
 
+        # 从建议文本中提取建议类型（只在建议字段中搜索，避免误匹配）
+        if suggestion_text:
+            for label, action in SUGGESTION_TYPES.items():
+                # 确保是完整词匹配，避免"暂不建仓"被误识别为"建仓"
+                if label in suggestion_text.split("，")[0].split(",")[0]:  # 只在第一个逗号前搜索
+                    result["action"] = action
+                    result["action_label"] = label
+                    result["should_alert"] = True
+                    break
         # 提取理由（支持多种格式）
         reason_patterns = [
             r"「理由」\s*[:：]?\s*(.+?)(?=「|$|\n\n)",
@@ -413,8 +407,18 @@ class IntradayMonitorAgent(BaseAgent):
             if not clean_content.startswith("[无需提醒]"):
                 result["reason"] = clean_content[:100]
 
-        # 最终 should_alert 判定：只在明确“建仓/加仓/减仓/清仓”时提醒
-        result["should_alert"] = result["action"] in {"buy", "add", "reduce", "sell"}
+        # 最终 should_alert 判定（只控制是否发送通知，不影响建议池保存）：
+        # - 明确操作（建仓/加仓/减仓/清仓）：发送通知
+        # - 观望但有明确风险信号（价格异动等）：发送通知提醒用户注意
+        # - 持有/观望无明确信号：不发送通知（避免干扰）
+        if result["action"] in {"buy", "add", "reduce", "sell"}:
+            result["should_alert"] = True
+        elif result["action"] == "watch" and result["signal"]:
+            # 观望但有信号（如价格异动、技术突破等），也通知用户注意
+            result["should_alert"] = True
+        else:
+            result["should_alert"] = False
+        
         return result
 
     async def analyze(self, context: AgentContext, data: dict) -> AnalysisResult:
@@ -451,20 +455,25 @@ class IntradayMonitorAgent(BaseAgent):
         # 解析操作建议
         suggestion = self._parse_suggestion(content)
 
-        # 保存到建议池（包含 prompt 上下文）
-        save_suggestion(
-            stock_symbol=stock.symbol,
-            stock_name=stock.name,
-            action=suggestion["action"],
-            action_label=suggestion["action_label"],
-            signal=suggestion.get("signal", ""),
-            reason=suggestion.get("reason", ""),
-            agent_name=self.name,
-            agent_label=self.display_name,
-            expires_hours=4,  # 盘中建议 4 小时有效
-            prompt_context=user_content,  # 保存 prompt 上下文
-            ai_response=content,  # 保存 AI 原始响应
-        )
+        # 特殊情况：AI 明确返回 [无需提醒] 时，不保存建议（既不显示也不通知）
+        if "[无需提醒]" in content:
+            logger.info(f"AI 判断无需提醒，跳过保存建议: {stock.symbol}")
+        else:
+            # 其他所有情况都保存到建议池（供前端显示）
+            # should_alert 只控制是否发送推送通知
+            save_suggestion(
+                stock_symbol=stock.symbol,
+                stock_name=stock.name,
+                action=suggestion["action"],
+                action_label=suggestion["action_label"],
+                signal=suggestion.get("signal", ""),
+                reason=suggestion.get("reason", ""),
+                agent_name=self.name,
+                agent_label=self.display_name,
+                expires_hours=4,  # 盘中建议 4 小时有效
+                prompt_context=user_content,  # 保存 prompt 上下文
+                ai_response=content,  # 保存 AI 原始响应
+            )
 
         # 构建标题
         title = f"【{self.display_name}】{stock.name} {stock.change_pct:+.2f}%"

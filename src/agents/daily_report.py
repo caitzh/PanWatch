@@ -249,6 +249,8 @@ class DailyReportAgent(BaseAgent):
                 style_labels = {"short": "短线", "swing": "波段", "long": "长线"}
                 style = style_labels.get(position.get("trading_style", "swing"), "波段")
                 lines.append(f"- 持仓：{total_qty}股 成本{avg_cost:.2f} 浮盈{pnl_pct:+.1f}%（{style}）")
+            else:
+                lines.append(f"- 持仓：未持仓")
 
         if not data["stocks"]:
             lines.append("- 今日无行情数据")
@@ -294,7 +296,8 @@ class DailyReportAgent(BaseAgent):
                 symbol_map[f"HK{sym}"] = sym
                 symbol_map[f"{sym}.HK"] = sym
             if getattr(s, "market", None) == MarketCode.CN and sym.isdigit() and len(sym) == 6:
-                prefix = "SH" if sym.startswith("6") or sym.startswith("000") else "SZ"
+                # 判断市场：6/9开头→上交所SH，0/1/2/3开头→深交所SZ
+                prefix = "SH" if sym.startswith(("6", "9")) else "SZ"
                 symbol_map[f"{prefix}{sym}"] = sym
                 symbol_map[f"{sym}.{prefix}"] = sym
             if getattr(s, "name", ""):

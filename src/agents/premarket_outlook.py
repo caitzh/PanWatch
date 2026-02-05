@@ -233,6 +233,8 @@ class PremarketOutlookAgent(BaseAgent):
                 style = style_labels.get(position.get("trading_style", "swing"), "波段")
                 avg_cost = safe_num(position.get('avg_cost'), 1)
                 lines.append(f"- 持仓：{position['total_quantity']}股 成本{avg_cost:.2f}（{style}）")
+            else:
+                lines.append(f"- 持仓：未持仓")
 
         lines.append("\n请根据以上信息，给出今日交易展望。")
 
@@ -265,7 +267,8 @@ class PremarketOutlookAgent(BaseAgent):
                 symbol_map[f"HK{sym}"] = sym
                 symbol_map[f"{sym}.HK"] = sym
             if getattr(s, "market", None) == MarketCode.CN and sym.isdigit() and len(sym) == 6:
-                prefix = "SH" if sym.startswith("6") or sym.startswith("000") else "SZ"
+                # 判断市场：6/9开头→上交所SH，0/1/2/3开头→深交所SZ
+                prefix = "SH" if sym.startswith(("6", "9")) else "SZ"
                 symbol_map[f"{prefix}{sym}"] = sym
                 symbol_map[f"{sym}.{prefix}"] = sym
             if getattr(s, "name", ""):

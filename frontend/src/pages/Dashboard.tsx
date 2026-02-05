@@ -286,8 +286,11 @@ export default function DashboardPage() {
     if (stocks.length > 0 && !initialScanDone.current) {
       initialScanDone.current = true
       loadMonitorFromPool() // 只从建议池加载已有数据，不调用AI分析
+    } else if (stocks.length > 0 && initialScanDone.current) {
+      // 当持仓数据变化时，重新加载监控数据以更新持仓状态
+      loadMonitorFromPool()
     }
-  }, [stocks])
+  }, [stocks, portfolioRaw])
 
   const loadIndices = async () => {
     setIndicesLoading(true)
@@ -448,19 +451,53 @@ export default function DashboardPage() {
     setScanning(true)
     try {
 
-      // 获取所有最新建议（返回格式: {symbol: suggestion}）
+      // 并发获取：建议、行情、K线数据
       const symbols = watchlistStocks.map(s => s.symbol).join(',')
-      const suggestionsDict = await fetchAPI<Record<string, any>>(`/suggestions?symbols=${encodeURIComponent(symbols)}`)
+      
+      const [suggestionsDict, quotesRes, klineResults] = await Promise.all([
+        // 获取所有最新建议（返回格式: {symbol: suggestion}）
+        fetchAPI<Record<string, any>>(`/suggestions?symbols=${encodeURIComponent(symbols)}`),
+        
+        // 获取实时行情
+        fetchAPI<QuoteResponse[]>('/quotes/batch', {
+          method: 'POST',
+          body: JSON.stringify({ items: watchlistStocks.map(s => ({ symbol: s.symbol, market: s.market })) }),
+        }),
+        
+        // 并发获取K线数据
+        Promise.allSettled(
+          watchlistStocks.map(stock =>
+            fetchAPI<{ symbol: string; market: string; summary: KlineSummary }>(
+              `/klines/${encodeURIComponent(stock.symbol)}/summary?market=${encodeURIComponent(stock.market)}`
+            ).catch(() => null)
+          )
+        )
+      ])
 
-      // 获取实时行情
-      const quotesRes = await fetchAPI<QuoteResponse[]>('/quotes/batch', {
-        method: 'POST',
-        body: JSON.stringify({ items: watchlistStocks.map(s => ({ symbol: s.symbol, market: s.market })) }),
-      })
       const quotesMap: Record<string, QuoteResponse> = {}
       for (const q of quotesRes || []) {
         quotesMap[`${q.market}:${q.symbol}`] = q
       }
+
+      // 构建K线数据映射
+      const klineMap: Record<string, KlineSummary> = {}
+      klineResults.forEach((result, idx) => {
+        if (result.status === 'fulfilled' && result.value) {
+          const stock = watchlistStocks[idx]
+          const key = `${stock.market}:${stock.symbol}`
+          klineMap[key] = result.value.summary
+        }
+      })
+
+      // 构建持仓映射
+      const positionMap: Record<string, boolean> = {}
+      for (const account of portfolioRaw?.accounts || []) {
+        for (const pos of account.positions || []) {
+          positionMap[pos.symbol] = true
+        }
+      }
+      
+      console.log('[Dashboard] positionMap:', positionMap)
 
       // suggestionsDict 是 {symbol: suggestion} 格式
       const stockSuggestions: Record<string, any> = suggestionsDict || {}
@@ -468,7 +505,13 @@ export default function DashboardPage() {
       const monitorData: MonitorStock[] = watchlistStocks.map(stock => {
         const quote = quotesMap[`${stock.market}:${stock.symbol}`]
         const sug = stockSuggestions[stock.symbol]
+        const kline = klineMap[`${stock.market}:${stock.symbol}`] || null
         const change_pct = quote?.change_pct || 0
+        const hasPosition = positionMap[stock.symbol] || false
+        
+        if (stock.symbol === '601127' || stock.symbol === '000158') {
+          console.log(`[Dashboard] ${stock.symbol} hasPosition:`, hasPosition, 'kline:', !!kline)
+        }
 
         return {
           symbol: stock.symbol,
@@ -482,11 +525,11 @@ export default function DashboardPage() {
           volume: quote?.volume || null,
           turnover: quote?.turnover || null,
           alert_type: Math.abs(change_pct) >= 3 ? (change_pct > 0 ? '急涨' : '急跌') : null,
-          has_position: false,
+          has_position: hasPosition,
           cost_price: null,
           pnl_pct: null,
           trading_style: null,
-          kline: null,
+          kline: kline,
           suggestion: sug ? {
             action: sug.action,
             action_label: sug.action_label,
@@ -507,7 +550,7 @@ export default function DashboardPage() {
     } finally {
       setScanning(false)
     }
-  }, [stocks])
+  }, [stocks, portfolioRaw])
 
   const scanAlerts = useCallback(async () => {
     if (!hasWatchlist) return

@@ -19,6 +19,7 @@ export interface KlineScoreSuggestion {
 }
 
 export function buildKlineSuggestion(s: KlineSummaryData, holding?: boolean): KlineScoreSuggestion {
+  console.log(`[buildKlineSuggestion] holding=${holding}, trend=${s.trend}, score will be calculated...`)
   let score = 0
   const items: KlineEvidenceItem[] = []
   const tags: string[] = []
@@ -123,6 +124,8 @@ export function buildKlineSuggestion(s: KlineSummaryData, holding?: boolean): Kl
     else if (score <= -2) action = 'avoid'
     else action = 'watch'
   }
+  
+  console.log(`[buildKlineSuggestion] Final: holding=${holdingFlag}, score=${score}, action=${action}`)
 
   const uniqTags = Array.from(new Set(tags))
   const signal = uniqTags.length > 0 ? uniqTags.join(' / ') : '技术面中性'

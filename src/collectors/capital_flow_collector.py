@@ -31,12 +31,20 @@ class CapitalFlow:
 
 
 def _get_eastmoney_secid(symbol: str, market: MarketCode) -> str:
-    """转换为东方财富的 secid 格式"""
+    """转换为东方财富的 secid 格式
+    
+    规则：
+    - 上交所：1.XXXXXX (6/9开头)
+    - 深交所：0.XXXXXX (0/1/2/3开头)
+    - 港股：116.XXXXX
+    - 美股：105.XXXXX
+    """
     if market == MarketCode.HK:
         return f"116.{symbol}"
     if market == MarketCode.US:
         return f"105.{symbol}"
-    prefix = "1" if symbol.startswith("6") or symbol.startswith("000") else "0"
+    # A股：6/9开头→上交所(1)，其他→深交所(0)
+    prefix = "1" if symbol.startswith(("6", "9")) else "0"
     return f"{prefix}.{symbol}"
 
 

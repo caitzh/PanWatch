@@ -140,6 +140,13 @@ export default function SettingsPage() {
   const [testing, setTesting] = useState<number | null>(null)
   const [testingModel, setTestingModel] = useState<number | null>(null)
 
+  // Password change dialog
+  const [passwordDialogOpen, setPasswordDialogOpen] = useState(false)
+  const [newPassword, setNewPassword] = useState('')
+  const [confirmPassword, setConfirmPassword] = useState('')
+  const [passwordVisible, setPasswordVisible] = useState(false)
+  const [changingPassword, setChangingPassword] = useState(false)
+
   const { toast } = useToast()
 
   const load = async () => {
@@ -350,6 +357,33 @@ export default function SettingsPage() {
     }
   }
 
+  const changePassword = async () => {
+    if (newPassword.length < 6) {
+      toast('密码长度至少 6 位', 'error')
+      return
+    }
+    if (newPassword !== confirmPassword) {
+      toast('两次输入的密码不一致', 'error')
+      return
+    }
+
+    setChangingPassword(true)
+    try {
+      await fetchAPI('/auth/change-password', {
+        method: 'POST',
+        body: JSON.stringify({ username: '', password: newPassword })
+      })
+      toast('密码已更新', 'success')
+      setPasswordDialogOpen(false)
+      setNewPassword('')
+      setConfirmPassword('')
+    } catch (e) {
+      toast(e instanceof Error ? e.message : '修改失败', 'error')
+    } finally {
+      setChangingPassword(false)
+    }
+  }
+
   const testChannel = async (id: number) => {
     setTesting(id)
     try {
@@ -553,6 +587,25 @@ export default function SettingsPage() {
             </div>
           </section>
         )}
+
+        {/* Account Security */}
+        <section className="card p-4 md:p-6">
+          <h3 className="text-[12px] md:text-[13px] font-semibold text-foreground mb-4 md:mb-5">账号安全</h3>
+          <div className="space-y-4">
+            <div>
+              <Label>登录密码</Label>
+              <div className="flex items-center gap-2.5 mt-2">
+                <Input type="password" value="••••••••" disabled className="font-mono" />
+                <Button onClick={() => setPasswordDialogOpen(true)} variant="outline" size="sm">
+                  修改密码
+                </Button>
+              </div>
+              <p className="text-[11px] text-muted-foreground mt-1.5">
+                定期修改密码可提高账号安全性
+              </p>
+            </div>
+          </div>
+        </section>
       </div>
 
       {/* Service Dialog */}
@@ -722,6 +775,68 @@ export default function SettingsPage() {
               <Button variant="ghost" onClick={() => setChannelDialogOpen(false)}>取消</Button>
               <Button onClick={saveChannel} disabled={!isChannelFormValid()}>
                 {editChannelId ? '保存' : '创建'}
+              </Button>
+            </div>
+          </div>
+        </DialogContent>
+      </Dialog>
+
+      {/* Password Change Dialog */}
+      <Dialog open={passwordDialogOpen} onOpenChange={setPasswordDialogOpen}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>修改密码</DialogTitle>
+            <DialogDescription>设置新的登录密码</DialogDescription>
+          </DialogHeader>
+          <div className="space-y-4 mt-2">
+            <div>
+              <Label>新密码</Label>
+              <div className="relative">
+                <Input
+                  type={passwordVisible ? 'text' : 'password'}
+                  value={newPassword}
+                  onChange={e => setNewPassword(e.target.value)}
+                  placeholder="至少 6 位"
+                  className="pr-10"
+                />
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="icon"
+                  className="absolute right-1 top-1/2 -translate-y-1/2 h-8 w-8"
+                  onClick={() => setPasswordVisible(!passwordVisible)}
+                >
+                  {passwordVisible ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+                </Button>
+              </div>
+            </div>
+            <div>
+              <Label>确认新密码</Label>
+              <Input
+                type={passwordVisible ? 'text' : 'password'}
+                value={confirmPassword}
+                onChange={e => setConfirmPassword(e.target.value)}
+                placeholder="再次输入新密码"
+                onKeyPress={e => e.key === 'Enter' && changePassword()}
+              />
+            </div>
+            <div className="flex justify-end gap-2 pt-2">
+              <Button 
+                variant="ghost" 
+                onClick={() => {
+                  setPasswordDialogOpen(false)
+                  setNewPassword('')
+                  setConfirmPassword('')
+                  setPasswordVisible(false)
+                }}
+              >
+                取消
+              </Button>
+              <Button 
+                onClick={changePassword} 
+                disabled={changingPassword || !newPassword || !confirmPassword}
+              >
+                {changingPassword ? '修改中...' : '确认修改'}
               </Button>
             </div>
           </div>

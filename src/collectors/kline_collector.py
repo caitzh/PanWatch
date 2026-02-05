@@ -81,13 +81,26 @@ class TechnicalIndicators:
 
 
 def _tencent_symbol(symbol: str, market: MarketCode) -> str:
-    """转换为腾讯 API 格式"""
+    """转换为腾讯 API 格式
+    
+    A股市场规则：
+    - 上交所：6/9 开头 -> sh
+    - 深交所：0/1/2/3 开头 -> sz
+    - 北交所：43/83/87/88/92 开头 -> bj
+    """
     if market == MarketCode.HK:
         return f"hk{symbol}"
     if market == MarketCode.US:
         return f"us{symbol}"
-    prefix = "sh" if symbol.startswith("6") or symbol.startswith("000") else "sz"
-    return prefix + symbol
+    
+    # 北交所
+    if symbol.startswith(("43", "83", "87", "88", "92")):
+        return f"bj{symbol}"
+    # 上交所：6开头（主板）或 9开头（B股）
+    if symbol.startswith("6") or symbol.startswith("9"):
+        return f"sh{symbol}"
+    # 深交所：0/1/2/3 开头（包括000主板、002中小板、300创业板等）
+    return f"sz{symbol}"
 
 
 def _calculate_ma(closes: list[float], period: int) -> float | None:

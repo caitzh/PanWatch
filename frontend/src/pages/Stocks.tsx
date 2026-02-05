@@ -380,6 +380,7 @@ export default function StocksPage() {
 
   // Stock list filter
   const [stockListFilter, setStockListFilter] = useState('')  // '' = 全部, 'CN' = A股, 'HK' = 港股, 'US' = 美股
+  const [showOnlyWithoutPosition, setShowOnlyWithoutPosition] = useLocalStorage('stocks-show-only-without-position', true)  // 只显示未持仓
 
   const { toast } = useToast()
   const navigate = useNavigate()
@@ -1631,7 +1632,7 @@ export default function StocksPage() {
                                     )}
                                   </td>
                                   <td className="px-4 py-2.5 text-center">
-                                    <div className="flex items-center justify-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
+                                    <div className="flex items-center justify-center gap-1">
                                       {(() => { const { suggestion, kline } = getSuggestionForStock(pos.symbol, pos.market, true); return (!suggestion && !kline) ? (
                                         <Button variant="ghost" size="icon" className="h-7 w-7" onClick={() => openKlineDialog(pos.symbol, pos.market, pos.name, true)} title="K线指标"><BarChart3 className="w-3 h-3" /></Button>
                                       ) : null })()}
@@ -1753,112 +1754,204 @@ export default function StocksPage() {
       )}
 
       {/* Stocks without positions (for agent config) */}
-      {stocks.filter(s => s.enabled).length > 0 && (
-        <div className="mt-6 card p-4">
-          <div className="flex items-center justify-between mb-3">
-            <h3 className="text-[13px] font-semibold text-foreground">自选股列表</h3>
-            <div className="flex items-center gap-1">
-              {[
-                { value: '', label: '全部', count: stocks.filter(s => s.enabled).length },
-                { value: 'CN', label: 'A股', count: stocks.filter(s => s.enabled && s.market === 'CN').length },
-                { value: 'HK', label: '港股', count: stocks.filter(s => s.enabled && s.market === 'HK').length },
-                { value: 'US', label: '美股', count: stocks.filter(s => s.enabled && s.market === 'US').length },
-              ].map(opt => (
-                <button
-                  key={opt.value}
-                  onClick={() => setStockListFilter(opt.value)}
-                  className={`text-[11px] px-2 py-0.5 rounded transition-colors ${
-                    stockListFilter === opt.value
-                      ? 'bg-primary text-primary-foreground'
-                      : 'bg-accent/50 text-muted-foreground hover:bg-accent'
-                  }`}
-                >
-                  {opt.label} ({opt.count})
-                </button>
-              ))}
+      {(() => {
+        const allPositionedSymbols = new Set(
+          portfolio?.accounts.flatMap(a => a.positions.map(p => p.symbol)) || []
+        )
+        const filteredStocks = stocks.filter(s => {
+          if (!s.enabled) return false
+          if (stockListFilter && s.market !== stockListFilter) return false
+          if (showOnlyWithoutPosition && allPositionedSymbols.has(s.symbol)) return false
+          return true
+        })
+        
+        if (filteredStocks.length === 0) return null
+        
+        return (
+          <div className="mt-6 card p-4">
+            <div className="flex items-center justify-between mb-3">
+              <h3 className="text-[13px] font-semibold text-foreground">自选股列表</h3>
+              <div className="flex items-center gap-3">
+                <div className="flex items-center gap-2">
+                  <Switch
+                    id="show-only-without-position"
+                    checked={showOnlyWithoutPosition}
+                    onCheckedChange={setShowOnlyWithoutPosition}
+                    className="scale-90"
+                  />
+                  <label htmlFor="show-only-without-position" className="text-[11px] text-muted-foreground cursor-pointer">
+                    只显示未持仓
+                  </label>
+                </div>
+                <div className="flex items-center gap-1">
+                  {[
+                    { value: '', label: '全部', count: stocks.filter(s => s.enabled && (!showOnlyWithoutPosition || !allPositionedSymbols.has(s.symbol))).length },
+                    { value: 'CN', label: 'A股', count: stocks.filter(s => s.enabled && s.market === 'CN' && (!showOnlyWithoutPosition || !allPositionedSymbols.has(s.symbol))).length },
+                    { value: 'HK', label: '港股', count: stocks.filter(s => s.enabled && s.market === 'HK' && (!showOnlyWithoutPosition || !allPositionedSymbols.has(s.symbol))).length },
+                    { value: 'US', label: '美股', count: stocks.filter(s => s.enabled && s.market === 'US' && (!showOnlyWithoutPosition || !allPositionedSymbols.has(s.symbol))).length },
+                  ].map(opt => (
+                    <button
+                      key={opt.value}
+                      onClick={() => setStockListFilter(opt.value)}
+                      className={`text-[11px] px-2 py-0.5 rounded transition-colors ${
+                        stockListFilter === opt.value
+                          ? 'bg-primary text-primary-foreground'
+                          : 'bg-accent/50 text-muted-foreground hover:bg-accent'
+                      }`}
+                    >
+                      {opt.label} ({opt.count})
+                    </button>
+                  ))}
+                </div>
+              </div>
+            </div>
+            
+            {/* Desktop Grid - Responsive columns (1-5 columns based on screen width) */}
+            <div className="hidden md:grid md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 2xl:grid-cols-5 gap-3">
+              {filteredStocks.map((stock) => {
+                const quote = getStockQuote(stock.symbol)
+                const badge = marketBadge(stock.market)
+                const changeColor = quote?.change_pct != null
+                  ? (quote.change_pct > 0 ? 'text-rose-500' : quote.change_pct < 0 ? 'text-emerald-500' : 'text-muted-foreground')
+                  : 'text-muted-foreground'
+                
+                return (
+                  <div key={stock.id} className="flex flex-col gap-2 p-3 rounded-lg bg-accent/30 hover:bg-accent/50 transition-colors border border-border/20">
+                    {/* 股票信息 */}
+                    <div className="flex-1 min-w-0">
+                      <div className="flex items-center gap-2 mb-1">
+                        <span className={`text-[9px] px-1 py-0.5 rounded ${badge.style}`}>{badge.label}</span>
+                        <span className="font-mono text-[11px] font-semibold text-foreground">{stock.symbol}</span>
+                        <span className="text-[11px] text-muted-foreground truncate">{stock.name}</span>
+                      </div>
+                      <div className={`font-mono text-[13px] ${changeColor} font-semibold mb-1.5`}>
+                        {quote?.current_price != null ? (
+                          <>
+                            {quote.current_price.toFixed(2)}
+                            {quote.change_pct != null && (
+                              <span className="ml-2 text-[11px]">
+                                {quote.change_pct >= 0 ? '+' : ''}{quote.change_pct.toFixed(2)}%
+                              </span>
+                            )}
+                          </>
+                        ) : '—'}
+                      </div>
+                      {(() => {
+                        const { suggestion, kline } = getSuggestionForStock(stock.symbol, stock.market, false)
+                        return (suggestion || kline) ? (
+                          <div className="mb-2">
+                            <SuggestionBadge
+                              suggestion={suggestion}
+                              stockName={stock.name}
+                              stockSymbol={stock.symbol}
+                              kline={kline}
+                              market={stock.market}
+                              hasPosition={false}
+                            />
+                          </div>
+                        ) : null
+                      })()}
+                    </div>
+                    
+                    {/* 操作区域 */}
+                    <div className="flex items-center justify-between gap-2 pt-2 border-t border-border/20">
+                      <button onClick={() => setAgentDialogStock(stock)} className="text-[10px] px-2 py-1 rounded bg-accent hover:bg-accent/80 transition-colors flex-shrink-0">
+                        {stock.agents && stock.agents.length > 0 ? (
+                          <span className="flex items-center gap-1">
+                            <Bot className="w-3 h-3" />
+                            {stock.agents.length}
+                          </span>
+                        ) : (
+                          <span className="text-muted-foreground/70 flex items-center gap-1">
+                            <Bot className="w-3 h-3" />
+                          </span>
+                        )}
+                      </button>
+                      <div className="flex items-center gap-0.5">
+                        {(() => { const { suggestion, kline } = getSuggestionForStock(stock.symbol, stock.market, false); return (!suggestion && !kline) ? (
+                          <Button variant="ghost" size="icon" className="h-7 w-7" onClick={() => openKlineDialog(stock.symbol, stock.market, stock.name, false)} title="K线指标"><BarChart3 className="w-3 h-3" /></Button>
+                        ) : null })()}
+                        <Button variant="ghost" size="icon" className="h-7 w-7" onClick={() => openNewsDialog(stock.name)} title="相关资讯"><Newspaper className="w-3 h-3" /></Button>
+                        <Button variant="ghost" size="icon" className="h-7 w-7" onClick={() => openStockDetail(stock.symbol, stock.market)} title="详情"><ExternalLink className="w-3 h-3" /></Button>
+                        <Button variant="ghost" size="icon" className="h-7 w-7 hover:text-destructive" onClick={() => handleDeleteStock(stock.id)}><Trash2 className="w-3 h-3" /></Button>
+                      </div>
+                    </div>
+                  </div>
+                )
+              })}
+            </div>
+
+            {/* Mobile Cards */}
+            <div className="md:hidden space-y-2">
+              {filteredStocks.map(stock => {
+                const quote = getStockQuote(stock.symbol)
+                const badge = marketBadge(stock.market)
+                const changeColor = quote?.change_pct != null
+                  ? (quote.change_pct > 0 ? 'text-rose-500' : quote.change_pct < 0 ? 'text-emerald-500' : 'text-muted-foreground')
+                  : 'text-muted-foreground'
+                
+                return (
+                  <div key={stock.id} className="p-3 rounded-lg bg-accent/30 hover:bg-accent/50 transition-colors">
+                    <div className="flex items-start justify-between mb-2">
+                      <div className="flex-1">
+                        <div className="flex items-center gap-2 mb-1">
+                          <span className={`text-[9px] px-1 py-0.5 rounded ${badge.style}`}>{badge.label}</span>
+                          <span className="font-mono text-[11px] text-muted-foreground">{stock.symbol}</span>
+                          <span className="text-[12px] text-foreground font-medium">{stock.name}</span>
+                        </div>
+                        {quote && (
+                          <div className={`font-mono text-[13px] ${changeColor} font-semibold`}>
+                            {quote.current_price?.toFixed(2)}
+                            {quote.change_pct != null && (
+                              <span className="ml-2">
+                                {quote.change_pct >= 0 ? '+' : ''}{quote.change_pct.toFixed(2)}%
+                              </span>
+                            )}
+                          </div>
+                        )}
+                      </div>
+                      <Button variant="ghost" size="icon" className="h-7 w-7 hover:text-destructive" onClick={() => handleDeleteStock(stock.id)}>
+                        <X className="w-3 h-3" />
+                      </Button>
+                    </div>
+                    
+                    {(() => {
+                      const { suggestion, kline } = getSuggestionForStock(stock.symbol, stock.market, false)
+                      return (suggestion || kline) ? (
+                        <div className="mb-2">
+                          <SuggestionBadge
+                            suggestion={suggestion}
+                            stockName={stock.name}
+                            stockSymbol={stock.symbol}
+                            kline={kline}
+                            market={stock.market}
+                            hasPosition={false}
+                          />
+                        </div>
+                      ) : null
+                    })()}
+                    
+                    <div className="flex items-center justify-between pt-2 border-t border-border/20">
+                      <button onClick={() => setAgentDialogStock(stock)} className="flex items-center gap-1.5 text-[11px]">
+                        {stock.agents && stock.agents.length > 0 ? (
+                          <Badge variant="default" className="text-[10px]">{stock.agents.length} Agent</Badge>
+                        ) : (
+                          <span className="text-muted-foreground/50 flex items-center gap-1"><Bot className="w-3 h-3" /> 未配置</span>
+                        )}
+                      </button>
+                      <div className="flex items-center gap-1">
+                        <Button variant="ghost" size="icon" className="h-7 w-7" onClick={() => openKlineDialog(stock.symbol, stock.market, stock.name, false)} title="K线指标"><BarChart3 className="w-3 h-3" /></Button>
+                        <Button variant="ghost" size="icon" className="h-7 w-7" onClick={() => openNewsDialog(stock.name)} title="相关资讯"><Newspaper className="w-3 h-3" /></Button>
+                        <Button variant="ghost" size="icon" className="h-7 w-7" onClick={() => openStockDetail(stock.symbol, stock.market)} title="详情"><ExternalLink className="w-3 h-3" /></Button>
+                      </div>
+                    </div>
+                  </div>
+                )
+              })}
             </div>
           </div>
-          <div className="flex flex-wrap gap-2">
-            {stocks.filter(s => s.enabled && (!stockListFilter || s.market === stockListFilter)).map(stock => {
-              const quote = getStockQuote(stock.symbol)
-              const changeColor = quote?.change_pct != null
-                ? (quote.change_pct > 0 ? 'text-rose-500' : quote.change_pct < 0 ? 'text-emerald-500' : 'text-muted-foreground')
-                : 'text-muted-foreground'
-              return (
-                <div
-                  key={stock.id}
-                  className="flex items-center gap-2 px-3 py-1.5 rounded-lg bg-accent/30 hover:bg-accent/50 transition-colors cursor-pointer"
-                  onClick={() => { setAgentDialogStock(stock);  }}
-                >
-                  <span className={`text-[9px] px-1 py-0.5 rounded ${marketBadge(stock.market).style}`}>
-                    {marketBadge(stock.market).label}
-                  </span>
-                  <span className="font-mono text-[11px] text-muted-foreground">{stock.symbol}</span>
-                  <span className="text-[12px] text-foreground">{stock.name}</span>
-                  {quote ? (
-                    <span className={`font-mono text-[11px] ${changeColor}`}>
-                      {quote.current_price?.toFixed(2)}
-                      {quote.change_pct != null && (
-                        <span className="ml-1">
-                          {quote.change_pct >= 0 ? '+' : ''}{quote.change_pct.toFixed(2)}%
-                        </span>
-                      )}
-                    </span>
-                  ) : (
-                    <span className="text-[10px] text-muted-foreground/50">--</span>
-                  )}
-                  {stock.agents && stock.agents.length > 0 && (
-                    <>
-                      <Badge variant="secondary" className="text-[10px]">{stock.agents.length} Agent</Badge>
-                      {runningAgents[stock.id] && (
-                        <span className="inline-flex items-center gap-1 text-[10px] text-amber-600">
-                          <span className="w-3 h-3 border-2 border-current/30 border-t-current rounded-full animate-spin" />
-                          {agents.find(a => a.name === runningAgents[stock.id])?.display_name || runningAgents[stock.id]}
-                        </span>
-                      )}
-                    </>
-                  )}
-                  <Button
-                    variant="ghost"
-                    size="icon"
-                    className="h-5 w-5 ml-1"
-                    onClick={(e) => { e.stopPropagation(); openKlineDialog(stock.symbol, stock.market, stock.name, false) }}
-                    title="K线指标"
-                  >
-                    <BarChart3 className="w-3 h-3" />
-                  </Button>
-                  <Button
-                    variant="ghost"
-                    size="icon"
-                    className="h-5 w-5 ml-1"
-                    onClick={(e) => { e.stopPropagation(); openNewsDialog(stock.name) }}
-                    title="相关资讯"
-                  >
-                    <Newspaper className="w-3 h-3" />
-                  </Button>
-                  <Button
-                    variant="ghost"
-                    size="icon"
-                    className="h-5 w-5 ml-1"
-                    onClick={(e) => { e.stopPropagation(); openStockDetail(stock.symbol, stock.market) }}
-                    title="详情"
-                  >
-                    <ExternalLink className="w-3 h-3" />
-                  </Button>
-                  <Button
-                    variant="ghost"
-                    size="icon"
-                    className="h-5 w-5 hover:text-destructive"
-                    onClick={(e) => { e.stopPropagation(); handleDeleteStock(stock.id) }}
-                  >
-                    <X className="w-3 h-3" />
-                  </Button>
-                </div>
-              )
-            })}
-          </div>
-        </div>
-      )}
+        )
+      })()}
 
       {/* Kline Dialog */}
       <KlineSummaryDialog
