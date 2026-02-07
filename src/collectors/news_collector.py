@@ -80,9 +80,11 @@ class XueqiuNewsCollector(BaseNewsCollector):
 
     def _get_symbol_id(self, symbol: str) -> str:
         """转换为雪球 symbol_id 格式"""
-        if symbol.startswith("6"):
+        # 5开头（ETF）、6开头（主板）、9开头（B股）→上交所SH
+        if symbol.startswith(("5", "6", "9")):
             return f"SH{symbol}"
-        elif symbol.startswith(("0", "3")):
+        # 0/1/2/3开头→深交所SZ（包括159/160开头的深交所ETF）
+        elif symbol.startswith(("0", "1", "2", "3")):
             return f"SZ{symbol}"
         else:
             return symbol

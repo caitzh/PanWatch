@@ -242,8 +242,8 @@ class NewsDigestAgent(BaseAgent):
                 symbol_map[f"{sym}.HK"] = sym
 
             if getattr(s, "market", None) == MarketCode.CN and sym.isdigit() and len(sym) == 6:
-                # 判断市场：6/9开头→上交所SH，0/1/2/3开头→深交所SZ
-                prefix = "SH" if sym.startswith(("6", "9")) else "SZ"
+                # 判断市场：5开头（ETF）、6开头（主板）、9开头（B股）→上交所SH，0/1/2/3开头→深交所SZ
+                prefix = "SH" if sym.startswith(("5", "6", "9")) else "SZ"
                 symbol_map[f"{prefix}{sym}"] = sym
                 symbol_map[f"{sym}.{prefix}"] = sym
 

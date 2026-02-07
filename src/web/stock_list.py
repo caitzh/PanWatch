@@ -21,7 +21,9 @@ EASTMONEY_PARAMS = {
     "fltt": "2",
     "invt": "2",
     "fid": "f12",
-    "fs": "m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23",
+    # 包含：沪主板(m:1+t:2)、科创板(m:1+t:23)、深主板(m:0+t:6)、创业板(m:0+t:80)
+    # 添加 ETF(m:1+t:1,m:0+t:13) 以支持场内基金
+    "fs": "m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23,m:1+t:1,m:0+t:13",
     "fields": "f12,f14",
 }
 
@@ -351,10 +353,10 @@ def _realtime_search(query: str, market: str = "", limit: int = 20) -> list[dict
         security_type = (item.get("SecurityTypeName") or "").strip()
         code_raw = (item.get("Code") or "").strip().upper()
 
-        # 判断市场
+        # 判断市场（支持股票和 ETF 基金）
         if (
-            classify in ("AStock", "BJStock")
-            or any(ch in security_type for ch in ("沪", "深", "北"))
+            classify in ("AStock", "BJStock", "ETF")
+            or any(ch in security_type for ch in ("沪", "深", "北", "ETF", "基金"))
             or code_raw.endswith(".BJ")
             or code_raw.startswith("BJ")
         ):
@@ -364,15 +366,15 @@ def _realtime_search(query: str, market: str = "", limit: int = 20) -> list[dict
         elif classify == "UsStock" or "美" in security_type:
             stock_market = "US"
         else:
-            continue  # 跳过其他类型（债券、基金等）
+            continue  # 跳过其他类型（债券等）
 
         # 市场筛选
         if market and stock_market != market:
             continue
 
-        # 只保留股票（排除债券等）
+        # 只保留股票和 ETF（排除债券等）
         type_us = item.get("TypeUS", "")
-        if stock_market == "US" and type_us and type_us not in ("1", "2", "3"):  # 1=普通股, 3=ADR/ADS 等；5=ETF 等
+        if stock_market == "US" and type_us and type_us not in ("1", "2", "3", "5"):  # 1=普通股, 3=ADR/ADS, 5=ETF
             continue
 
         code = item.get("Code", "")

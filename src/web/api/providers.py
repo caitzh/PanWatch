@@ -29,6 +29,7 @@ class ModelResponse(BaseModel):
     service_id: int
     model: str
     is_default: bool
+    extra_params: dict = {}
 
     class Config:
         from_attributes = True
@@ -58,7 +59,14 @@ def _service_to_response(service: AIService) -> dict:
         "base_url": service.base_url,
         "api_key": service.api_key or "",
         "models": [
-            {"id": m.id, "name": m.name, "service_id": m.service_id, "model": m.model, "is_default": m.is_default}
+            {
+                "id": m.id,
+                "name": m.name,
+                "service_id": m.service_id,
+                "model": m.model,
+                "is_default": m.is_default,
+                "extra_params": m.extra_params or {},
+            }
             for m in service.models
         ],
     }
@@ -104,6 +112,7 @@ class ModelCreate(BaseModel):
     service_id: int
     model: str
     is_default: bool = False
+    extra_params: dict = {}
 
 
 class ModelUpdate(BaseModel):
@@ -111,11 +120,24 @@ class ModelUpdate(BaseModel):
     service_id: int | None = None
     model: str | None = None
     is_default: bool | None = None
+    extra_params: dict | None = None
 
 
 @router.get("/models", response_model=list[ModelResponse])
 def list_models(db: Session = Depends(get_db)):
-    return db.query(AIModel).order_by(AIModel.id).all()
+    models = db.query(AIModel).order_by(AIModel.id).all()
+    return [_model_to_response(m) for m in models]
+
+
+def _model_to_response(model: AIModel) -> dict:
+    return {
+        "id": model.id,
+        "name": model.name,
+        "service_id": model.service_id,
+        "model": model.model,
+        "is_default": model.is_default,
+        "extra_params": model.extra_params or {},
+    }
 
 
 @router.post("/models", response_model=ModelResponse)
@@ -134,7 +156,7 @@ def create_model(body: ModelCreate, db: Session = Depends(get_db)):
     db.add(model)
     db.commit()
     db.refresh(model)
-    return model
+    return _model_to_response(model)
 
 
 @router.put("/models/{model_id}", response_model=ModelResponse)
@@ -152,7 +174,7 @@ def update_model(model_id: int, body: ModelUpdate, db: Session = Depends(get_db)
 
     db.commit()
     db.refresh(model)
-    return model
+    return _model_to_response(model)
 
 
 @router.delete("/models/{model_id}")
@@ -180,6 +202,7 @@ async def test_model(model_id: int, db: Session = Depends(get_db)):
             base_url=service.base_url,
             api_key=service.api_key,
             model=model.model,
+            extra_params=model.extra_params or {},
         )
         reply = await client.chat(
             system_prompt="You are a helpful assistant.",

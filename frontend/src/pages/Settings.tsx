@@ -25,6 +25,7 @@ interface ModelForm {
   name: string
   service_id: number | null
   model: string
+  enable_thinking: boolean
 }
 
 interface ChannelForm {
@@ -108,7 +109,7 @@ const CHANNEL_TYPE_FIELDS: Record<string, { label: string; fields: ChannelFieldD
 }
 
 const emptyServiceForm: ServiceForm = { name: '', base_url: '', api_key: '' }
-const emptyModelForm: ModelForm = { name: '', service_id: null, model: '' }
+const emptyModelForm: ModelForm = { name: '', service_id: null, model: '', enable_thinking: false }
 const emptyChannelForm: ChannelForm = { name: '', type: 'telegram', config: {} }
 
 export default function SettingsPage() {
@@ -230,7 +231,12 @@ export default function SettingsPage() {
   // Model CRUD
   const openModelDialog = (serviceId?: number, model?: AIModel) => {
     if (model) {
-      setModelForm({ name: model.name, service_id: model.service_id, model: model.model })
+      setModelForm({
+        name: model.name,
+        service_id: model.service_id,
+        model: model.model,
+        enable_thinking: (model.extra_params?.enable_thinking as boolean) ?? false
+      })
       setEditModelId(model.id)
     } else {
       setModelForm({ ...emptyModelForm, service_id: serviceId ?? null })
@@ -241,10 +247,16 @@ export default function SettingsPage() {
 
   const saveModel = async () => {
     try {
+      const payload = {
+        name: modelForm.name,
+        service_id: modelForm.service_id,
+        model: modelForm.model,
+        extra_params: { enable_thinking: modelForm.enable_thinking }
+      }
       if (editModelId) {
-        await fetchAPI(`/providers/models/${editModelId}`, { method: 'PUT', body: JSON.stringify(modelForm) })
+        await fetchAPI(`/providers/models/${editModelId}`, { method: 'PUT', body: JSON.stringify(payload) })
       } else {
-        await fetchAPI('/providers/models', { method: 'POST', body: JSON.stringify(modelForm) })
+        await fetchAPI('/providers/models', { method: 'POST', body: JSON.stringify(payload) })
       }
       setModelDialogOpen(false)
       load()
@@ -699,8 +711,18 @@ export default function SettingsPage() {
               <Input
                 value={modelForm.model}
                 onChange={e => setModelForm({ ...modelForm, model: e.target.value })}
-                placeholder="gpt-4o / glm-4-flash"
+                placeholder="gpt-4o / glm-4-flash / kimi-k2.5"
                 className="font-mono"
+              />
+            </div>
+            <div className="flex items-center justify-between py-2">
+              <div className="space-y-0.5">
+                <Label className="text-sm">开启思维链 (CoT)</Label>
+                <p className="text-[11px] text-muted-foreground">适用于 DeepSeek-R1、Kimi-K2.5 等支持思维链的模型</p>
+              </div>
+              <Switch
+                checked={modelForm.enable_thinking}
+                onCheckedChange={checked => setModelForm({ ...modelForm, enable_thinking: checked })}
               />
             </div>
             <div className="flex justify-end gap-2 pt-2">

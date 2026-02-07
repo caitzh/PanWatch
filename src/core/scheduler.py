@@ -107,15 +107,29 @@ class AgentScheduler:
         try:
             # 每次执行时动态构建 context（获取最新配置）
             context = self.context_builder(agent_name)
+
+            # 检查是否交易日（A股市场）
+            from datetime import datetime
+            from src.models.market import MarketCode
+            cn_market = MARKETS.get(MarketCode.CN)
+            if cn_market:
+                now = datetime.now(cn_market.get_tz())
+                if now.weekday() >= 5:  # 周末
+                    logger.info(f"[调度] 跳过 {agent.display_name}（周末休市）")
+                    return
+
             logger.info(f"[调度] 开始执行 Agent: {agent.display_name}")
             mode = self.execution_modes.get(agent_name, "batch")
             if mode == "single" and hasattr(agent, "run_single"):
                 processed = 0
                 skipped = 0
                 errors: list[str] = []
+                # 盘中监测需要检查交易时段，技术分析等盘后分析不需要
+                check_trading_time = agent_name == "intraday_monitor"
                 for stock in list(context.watchlist):
                     market_def = MARKETS.get(stock.market)
-                    if market_def and not market_def.is_trading_time():
+                    # 盘中监测：检查是否在交易时段内
+                    if check_trading_time and market_def and not market_def.is_trading_time():
                         skipped += 1
                         logger.info(
                             f"[调度] 跳过 {agent.display_name} {stock.symbol}（{market_def.name} 非交易时段）"

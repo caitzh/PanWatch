@@ -43,8 +43,8 @@ def _get_eastmoney_secid(symbol: str, market: MarketCode) -> str:
         return f"116.{symbol}"
     if market == MarketCode.US:
         return f"105.{symbol}"
-    # A股：6/9开头→上交所(1)，其他→深交所(0)
-    prefix = "1" if symbol.startswith(("6", "9")) else "0"
+    # A股：5开头（ETF）、6开头（主板）、9开头（B股）→上交所(1)，其他→深交所(0)
+    prefix = "1" if symbol.startswith(("5", "6", "9")) else "0"
     return f"{prefix}.{symbol}"
 
 

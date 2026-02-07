@@ -96,10 +96,10 @@ def _tencent_symbol(symbol: str, market: MarketCode) -> str:
     # 北交所
     if symbol.startswith(("43", "83", "87", "88", "92")):
         return f"bj{symbol}"
-    # 上交所：6开头（主板）或 9开头（B股）
-    if symbol.startswith("6") or symbol.startswith("9"):
+    # 上交所：5开头（ETF/基金）、6开头（主板）、9开头（B股）
+    if symbol.startswith(("5", "6", "9")):
         return f"sh{symbol}"
-    # 深交所：0/1/2/3 开头（包括000主板、002中小板、300创业板等）
+    # 深交所：0/1/2/3 开头（包括000主板、002中小板、300创业板、159/160开头ETF等）
     return f"sz{symbol}"
 
 

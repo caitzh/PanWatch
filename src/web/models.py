@@ -27,6 +27,7 @@ class AIModel(Base):
     service_id = Column(Integer, ForeignKey("ai_services.id", ondelete="CASCADE"), nullable=False)
     model = Column(String, nullable=False)  # 实际模型标识，如 "glm-4-flash"
     is_default = Column(Boolean, default=False)
+    extra_params = Column(JSON, default={})  # 额外参数，如 {"enable_thinking": true}
     created_at = Column(DateTime, server_default=func.now())
 
     service = relationship("AIService", back_populates="models")

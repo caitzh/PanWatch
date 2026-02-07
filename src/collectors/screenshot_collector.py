@@ -88,24 +88,24 @@ class ScreenshotCollector:
         """新浪财经 URL"""
         if market.upper() == "HK":
             return f"https://stock.finance.sina.com.cn/hkstock/quotes/{symbol}.html"
-        # A股：6/9开头→上交所sh，其他→深交所sz
-        prefix = "sh" if symbol.startswith(("6", "9")) else "sz"
+        # A股：5开头（ETF）、6开头（主板）、9开头（B股）→上交所sh，其他→深交所sz
+        prefix = "sh" if symbol.startswith(("5", "6", "9")) else "sz"
         return f"https://finance.sina.com.cn/realstock/company/{prefix}{symbol}/nc.shtml"
 
     def _get_eastmoney_url(self, symbol: str, market: str) -> str:
         """东方财富 URL"""
         if market.upper() == "HK":
             return f"https://quote.eastmoney.com/hk/{symbol}.html"
-        # A股：6/9开头→上交所sh，其他→深交所sz
-        prefix = "sh" if symbol.startswith(("6", "9")) else "sz"
+        # A股：5开头（ETF）、6开头（主板）、9开头（B股）→上交所sh，其他→深交所sz
+        prefix = "sh" if symbol.startswith(("5", "6", "9")) else "sz"
         return f"https://quote.eastmoney.com/{prefix}{symbol}.html"
 
     def _get_xueqiu_url(self, symbol: str, market: str) -> str:
         """雪球 URL"""
         if market.upper() == "HK":
             return f"https://xueqiu.com/S/{symbol}"
-        # A股：6/9开头→上交所SH，其他→深交所SZ
-        prefix = "SH" if symbol.startswith(("6", "9")) else "SZ"
+        # A股：5开头（ETF）、6开头（主板）、9开头（B股）→上交所SH，其他→深交所SZ
+        prefix = "SH" if symbol.startswith(("5", "6", "9")) else "SZ"
         return f"https://xueqiu.com/S/{prefix}{symbol}"
 
     async def capture(

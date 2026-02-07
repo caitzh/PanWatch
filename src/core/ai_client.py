@@ -10,7 +10,7 @@ logger = logging.getLogger(__name__)
 class AIClient:
     """OpenAI 协议兼容的 AI 客户端"""
 
-    def __init__(self, base_url: str, api_key: str, model: str, proxy: str = ""):
+    def __init__(self, base_url: str, api_key: str, model: str, proxy: str = "", extra_params: dict | None = None):
         kwargs = {
             "base_url": base_url,
             "api_key": api_key,
@@ -20,6 +20,7 @@ class AIClient:
         self.client = AsyncOpenAI(**kwargs)
         self.model = model
         self.total_tokens_used = 0
+        self.extra_params = extra_params or {}
 
     async def chat(
         self,
@@ -56,11 +57,29 @@ class AIClient:
             messages.append({"role": "user", "content": user_content})
 
         try:
-            response = await self.client.chat.completions.create(
-                model=self.model,
-                messages=messages,
-                temperature=temperature,
-            )
+            # 构建请求参数
+            request_params = {
+                "model": self.model,
+                "messages": messages,
+                "temperature": temperature,
+            }
+
+            # 处理额外参数
+            if self.extra_params:
+                # OpenAI 标准参数列表
+                standard_params = {"temperature", "max_tokens", "top_p", "frequency_penalty",
+                                   "presence_penalty", "stop", "stream", "user"}
+                extra_body = {}
+                for key, value in self.extra_params.items():
+                    if key in standard_params:
+                        request_params[key] = value
+                    else:
+                        # 非标准参数（如 enable_thinking）放入 extra_body
+                        extra_body[key] = value
+                if extra_body:
+                    request_params["extra_body"] = extra_body
+
+            response = await self.client.chat.completions.create(**request_params)
             # 记录 token 用量
             if response.usage:
                 self.total_tokens_used += response.usage.total_tokens
@@ -69,7 +88,15 @@ class AIClient:
                     f"{response.usage.completion_tokens} = {response.usage.total_tokens}"
                 )
 
-            return response.choices[0].message.content or ""
+            message = response.choices[0].message
+            content = message.content or ""
+
+            # 打印思维链（CoT 模型如 DeepSeek-R1、Kimi-K2.5 等）
+            reasoning_content = getattr(message, "reasoning_content", None)
+            if reasoning_content:
+                logger.info(f"[AI 思维链]\n{reasoning_content}\n[/AI 思维链]")
+
+            return content
 
         except Exception as e:
             logger.error(f"AI 调用失败: {e}")

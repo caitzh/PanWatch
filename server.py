@@ -607,6 +607,7 @@ def _build_ai_client(model: AIModel | None, service: AIService | None, proxy: st
             api_key=service.api_key,
             model=model.model,
             proxy=proxy,
+            extra_params=model.extra_params or {},
         )
     # 回退到环境变量配置
     settings = Settings()
