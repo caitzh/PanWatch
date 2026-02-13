@@ -1,12 +1,12 @@
 import { useState, useEffect } from 'react'
 import { Pencil, Play, Database, Newspaper, LineChart, TrendingUp, DollarSign, Image, Layers, Check, X, Clock } from 'lucide-react'
-import { fetchAPI, type DataSource } from '@/lib/utils'
-import { Input } from '@/components/ui/input'
-import { Label } from '@/components/ui/label'
-import { Button } from '@/components/ui/button'
-import { Switch } from '@/components/ui/switch'
-import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription } from '@/components/ui/dialog'
-import { useToast } from '@/components/ui/toast'
+import { fetchAPI, type DataSource } from '@panwatch/api'
+import { Input } from '@panwatch/base-ui/components/ui/input'
+import { Label } from '@panwatch/base-ui/components/ui/label'
+import { Button } from '@panwatch/base-ui/components/ui/button'
+import { Switch } from '@panwatch/base-ui/components/ui/switch'
+import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription } from '@panwatch/base-ui/components/ui/dialog'
+import { useToast } from '@panwatch/base-ui/components/ui/toast'
 
 interface TestLogItem {
   timestamp: string
@@ -48,6 +48,7 @@ const DATASOURCE_TYPES = {
   kline: { label: 'K线数据', icon: LineChart, color: 'text-orange-500' },
   capital_flow: { label: '资金流向', icon: DollarSign, color: 'text-yellow-500' },
   quote: { label: '实时行情', icon: TrendingUp, color: 'text-emerald-500' },
+  events: { label: '事件日历', icon: Layers, color: 'text-violet-500' },
   chart: { label: 'K线截图', icon: Image, color: 'text-purple-500' },
 }
 
@@ -287,7 +288,10 @@ export default function DataSourcesPage() {
 
       {/* Test Result Dialog */}
       <Dialog open={testResultOpen} onOpenChange={setTestResultOpen}>
-        <DialogContent className="max-w-2xl" onInteractOutside={(e) => e.preventDefault()}>
+        <DialogContent
+          className="max-w-2xl w-[92vw] max-h-[85vh] overflow-y-auto scrollbar"
+          onInteractOutside={(e) => e.preventDefault()}
+        >
           <DialogHeader>
             <DialogTitle className="flex items-center gap-2">
               {testResult?.success ? (
@@ -303,7 +307,7 @@ export default function DataSourcesPage() {
             </DialogDescription>
           </DialogHeader>
 
-          <div className="space-y-4 mt-2">
+          <div className="space-y-4 mt-2 pr-1">
             {/* Summary */}
             <div className="flex items-center gap-4 p-3 rounded-lg bg-accent/30">
               <div className="flex-1">
@@ -382,6 +386,18 @@ export default function DataSourcesPage() {
                       <div key={i} className="flex items-start gap-2 p-2 rounded-lg bg-accent/30">
                         <span className="text-[12px] text-foreground flex-1">{newsItem.title}</span>
                         <span className="text-[11px] text-muted-foreground flex-shrink-0">{newsItem.time}</span>
+                      </div>
+                    )
+                  })}
+
+                  {/* Events type */}
+                  {testResult.source_type === 'events' && testResult.data.map((item, i) => {
+                    const ev = item as { title?: string; time?: string; event_type?: string }
+                    return (
+                      <div key={i} className="flex items-start gap-2 p-2 rounded-lg bg-accent/30">
+                        <span className="text-[11px] font-mono text-muted-foreground/80 flex-shrink-0">{ev.event_type || 'notice'}</span>
+                        <span className="text-[12px] text-foreground flex-1">{ev.title}</span>
+                        <span className="text-[11px] text-muted-foreground flex-shrink-0">{ev.time}</span>
                       </div>
                     )
                   })}

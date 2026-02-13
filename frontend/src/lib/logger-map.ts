@@ -1,9 +1,10 @@
 // Map Python module logger names to concise Chinese display names
 export const LOGGER_MAPPING: Record<string, string> = {
   // Agents
-  'src.agents.daily_report': '盘后日报',
+  'src.agents.daily_report': '收盘复盘',
   'src.agents.premarket_outlook': '盘前分析',
   'src.agents.intraday_monitor': '盘中监测',
+  'src.agents.base': 'Agent执行链路',
   'src.agents.news_digest': '新闻速递',
   'src.agents.chart_analyst': '技术分析',
 

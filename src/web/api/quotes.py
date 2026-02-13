@@ -38,6 +38,10 @@ def _quote_to_response(symbol: str, market: MarketCode, quote: dict | None) -> d
             "low_price": None,
             "volume": None,
             "turnover": None,
+            "turnover_rate": None,
+            "pe_ratio": None,
+            "total_market_value": None,
+            "circulating_market_value": None,
         }
 
     return {
@@ -53,6 +57,10 @@ def _quote_to_response(symbol: str, market: MarketCode, quote: dict | None) -> d
         "low_price": quote.get("low_price"),
         "volume": quote.get("volume"),
         "turnover": quote.get("turnover"),
+        "turnover_rate": quote.get("turnover_rate"),
+        "pe_ratio": quote.get("pe_ratio"),
+        "total_market_value": quote.get("total_market_value"),
+        "circulating_market_value": quote.get("circulating_market_value"),
     }
 
 

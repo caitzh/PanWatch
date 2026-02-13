@@ -3,6 +3,7 @@ import logging
 import time
 import httpx
 from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 from pydantic import BaseModel
 
@@ -134,6 +135,7 @@ class PositionResponse(BaseModel):
     cost_price: float
     quantity: int
     invested_amount: float | None
+    sort_order: int
     trading_style: str | None
     # 关联信息
     account_name: str | None = None
@@ -142,6 +144,15 @@ class PositionResponse(BaseModel):
 
     class Config:
         from_attributes = True
+
+
+class PositionReorderItem(BaseModel):
+    id: int
+    sort_order: int
+
+
+class PositionReorderRequest(BaseModel):
+    items: list[PositionReorderItem]
 
 
 # ========== Account Endpoints ==========
@@ -220,7 +231,7 @@ def list_positions(
     if stock_id:
         query = query.filter(Position.stock_id == stock_id)
 
-    positions = query.all()
+    positions = query.order_by(Position.account_id.asc(), Position.sort_order.asc(), Position.id.asc()).all()
     result = []
     for pos in positions:
         result.append({
@@ -230,6 +241,7 @@ def list_positions(
             "cost_price": pos.cost_price,
             "quantity": pos.quantity,
             "invested_amount": pos.invested_amount,
+            "sort_order": pos.sort_order or 0,
             "trading_style": pos.trading_style,
             "account_name": pos.account.name if pos.account else None,
             "stock_symbol": pos.stock.symbol if pos.stock else None,
@@ -258,12 +270,17 @@ def create_position(data: PositionCreate, db: Session = Depends(get_db)):
     if existing:
         raise HTTPException(400, f"账户 {account.name} 已有 {stock.name} 的持仓，请编辑现有持仓")
 
+    max_order = db.query(func.max(Position.sort_order)).filter(
+        Position.account_id == data.account_id
+    ).scalar() or 0
+
     position = Position(
         account_id=data.account_id,
         stock_id=data.stock_id,
         cost_price=data.cost_price,
         quantity=data.quantity,
         invested_amount=data.invested_amount,
+        sort_order=int(max_order) + 1,
         trading_style=data.trading_style,
     )
     db.add(position)
@@ -278,6 +295,7 @@ def create_position(data: PositionCreate, db: Session = Depends(get_db)):
         "cost_price": position.cost_price,
         "quantity": position.quantity,
         "invested_amount": position.invested_amount,
+        "sort_order": position.sort_order or 0,
         "trading_style": position.trading_style,
         "account_name": account.name,
         "stock_symbol": stock.symbol,
@@ -313,6 +331,7 @@ def update_position(position_id: int, data: PositionUpdate, db: Session = Depend
         "cost_price": position.cost_price,
         "quantity": position.quantity,
         "invested_amount": position.invested_amount,
+        "sort_order": position.sort_order or 0,
         "trading_style": position.trading_style,
         "account_name": position.account.name,
         "stock_symbol": position.stock.symbol,
@@ -331,6 +350,25 @@ def delete_position(position_id: int, db: Session = Depends(get_db)):
     db.commit()
     logger.info(f"删除持仓: {position.account.name} - {position.stock.name}")
     return {"success": True}
+
+
+@router.put("/positions/reorder/batch")
+def reorder_positions(data: PositionReorderRequest, db: Session = Depends(get_db)):
+    """批量更新持仓排序"""
+    if not data.items:
+        return {"updated": 0}
+    ids = [int(x.id) for x in data.items]
+    rows = db.query(Position).filter(Position.id.in_(ids)).all()
+    row_map = {r.id: r for r in rows}
+    updated = 0
+    for item in data.items:
+        row = row_map.get(int(item.id))
+        if not row:
+            continue
+        row.sort_order = int(item.sort_order)
+        updated += 1
+    db.commit()
+    return {"updated": updated}
 
 
 # ========== Portfolio Summary ==========
@@ -397,7 +435,11 @@ def get_portfolio_summary(
         acc_market_value = 0
         acc_cost = 0
 
-        for pos in acc.positions:
+        positions_sorted = sorted(
+            list(acc.positions or []),
+            key=lambda p: (int(getattr(p, "sort_order", 0) or 0), int(p.id)),
+        )
+        for pos in positions_sorted:
             stock = stock_map.get(pos.stock_id)
             if not stock:
                 continue
@@ -441,6 +483,7 @@ def get_portfolio_summary(
                 "cost_price": pos.cost_price,
                 "quantity": pos.quantity,
                 "invested_amount": pos.invested_amount,
+                "sort_order": pos.sort_order or 0,
                 "trading_style": pos.trading_style,
                 "current_price": current_price,
                 "current_price_cny": round(current_price * rate, 2) if current_price else None,

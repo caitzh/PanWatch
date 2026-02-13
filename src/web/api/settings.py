@@ -6,6 +6,7 @@ from pydantic import BaseModel
 from src.web.database import get_db
 from src.web.models import AppSettings
 from src.config import Settings
+from src.core.update_checker import check_update
 
 router = APIRouter()
 
@@ -47,6 +48,10 @@ class SettingResponse(BaseModel):
 # 配置项描述
 SETTING_DESCRIPTIONS = {
     "http_proxy": "HTTP 代理地址",
+    "notify_quiet_hours": "通知静默时间段（HH:MM-HH:MM，空为关闭）",
+    "notify_retry_attempts": "通知失败重试次数（不含首次）",
+    "notify_retry_backoff_seconds": "通知重试退避秒数（基数）",
+    "notify_dedupe_ttl_overrides": "通知幂等窗口覆盖（JSON，空为默认）",
 }
 
 SETTING_KEYS = list(SETTING_DESCRIPTIONS.keys())
@@ -57,6 +62,10 @@ def _get_env_defaults() -> dict[str, str]:
     s = Settings()
     return {
         "http_proxy": s.http_proxy,
+        "notify_quiet_hours": s.notify_quiet_hours,
+        "notify_retry_attempts": str(s.notify_retry_attempts),
+        "notify_retry_backoff_seconds": str(s.notify_retry_backoff_seconds),
+        "notify_dedupe_ttl_overrides": s.notify_dedupe_ttl_overrides,
     }
 
 
@@ -105,3 +114,26 @@ def update_setting(key: str, update: SettingUpdate, db: Session = Depends(get_db
 def get_version():
     """获取应用版本号"""
     return {"version": get_app_version()}
+
+
+@router.get("/update-check")
+def get_update_check(db: Session = Depends(get_db)):
+    """检查是否有可用新版本（带服务端缓存）。"""
+    current = get_app_version()
+    app_proxy = (
+        db.query(AppSettings)
+        .filter(AppSettings.key == "http_proxy")
+        .first()
+    )
+    proxy = (app_proxy.value if app_proxy and app_proxy.value else "").strip() or (
+        Settings().http_proxy or ""
+    )
+    result = check_update(current, proxy=proxy)
+    err = str(result.get("error") or "").strip()
+    if err:
+        return {
+            "success": False,
+            "code": 10061,
+            "message": err,
+        }
+    return result

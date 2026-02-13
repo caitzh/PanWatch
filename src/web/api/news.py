@@ -38,6 +38,7 @@ async def get_news(
     hours: int = Query(default=168, ge=1, le=720, description="时间范围（小时，默认7天）"),
     limit: int = Query(default=50, ge=1, le=200, description="返回数量"),
     filter_related: bool = Query(default=True, description="只显示相关新闻"),
+    source: str = Query(default="", description="来源过滤，逗号分隔：xueqiu/eastmoney_news/eastmoney"),
     db: Session = Depends(get_db),
 ):
     """
@@ -72,6 +73,8 @@ async def get_news(
     if not symbol_list:
         return []
 
+    source_filters = {s.strip() for s in source.split(",") if s.strip()} if source else set()
+
     # 构建匹配关键词（股票代码 + 股票名称）
     keywords = set(symbol_list)
     for sym in symbol_list:
@@ -100,6 +103,8 @@ async def get_news(
 
     result = []
     for item in news_items:
+        if source_filters and item.source not in source_filters:
+            continue
         # 过滤不相关的新闻
         if filter_related and not is_related(item):
             continue

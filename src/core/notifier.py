@@ -3,6 +3,7 @@ import os
 import re
 
 import apprise
+import asyncio
 import httpx
 
 logger = logging.getLogger(__name__)
@@ -13,9 +14,12 @@ def get_global_proxy() -> str:
     try:
         from src.web.database import SessionLocal
         from src.web.models import AppSettings
+
         db = SessionLocal()
         try:
-            setting = db.query(AppSettings).filter(AppSettings.key == "http_proxy").first()
+            setting = (
+                db.query(AppSettings).filter(AppSettings.key == "http_proxy").first()
+            )
             return setting.value if setting and setting.value else ""
         finally:
             db.close()
@@ -45,13 +49,18 @@ def sanitize_for_telegram(content: str) -> str:
     content = re.sub(r"_(.+?)_", r"\1", content)  # 移除斜体 _
     content = re.sub(r"~~(.+?)~~", r"\1", content)  # 移除删除线
     content = re.sub(r"`(.+?)`", r"\1", content)  # 移除行内代码
-    content = re.sub(r"^\s*[-*+]\s+", "· ", content, flags=re.MULTILINE)  # 列表符号改为 ·
-    content = re.sub(r"^\s*\d+\.\s+", "", content, flags=re.MULTILINE)  # 移除有序列表数字
+    content = re.sub(
+        r"^\s*[-*+]\s+", "· ", content, flags=re.MULTILINE
+    )  # 列表符号改为 ·
+    content = re.sub(
+        r"^\s*\d+\.\s+", "", content, flags=re.MULTILINE
+    )  # 移除有序列表数字
 
     # 清理多余空白
     content = re.sub(r"\n\s*\n\s*\n", "\n\n", content)
     content = re.sub(r" +", " ", content)
     return content.strip()
+
 
 # 渠道类型定义 (label + 表单字段)
 CHANNEL_TYPES = {
@@ -65,7 +74,12 @@ CHANNEL_TYPES = {
     },
     "dingtalk": {
         "label": "钉钉机器人",
-        "fields": ["token", "secret", "phones", "keyword"],  # keyword 选填：安全设置为“关键字”时自动附加
+        "fields": [
+            "token",
+            "secret",
+            "phones",
+            "keyword",
+        ],  # keyword 选填：安全设置为“关键字”时自动附加
     },
     "wecom": {
         "label": "企业微信机器人",
@@ -147,7 +161,11 @@ def build_apprise_url(channel_type: str, config: dict) -> str | None:
         base = f"dingtalk://{secret}@{token}/" if secret else f"dingtalk://{token}/"
         if phones:
             # 仅保留数字和逗号
-            phone_list = [re.sub(r"[^0-9]", "", p) for p in phones.split(",") if re.sub(r"[^0-9]", "", p)]
+            phone_list = [
+                re.sub(r"[^0-9]", "", p)
+                for p in phones.split(",")
+                if re.sub(r"[^0-9]", "", p)
+            ]
             if phone_list:
                 base += f"?to={','.join(phone_list)}"
         return base
@@ -179,12 +197,13 @@ def build_apprise_url(channel_type: str, config: dict) -> str | None:
 class NotifierManager:
     """通知管理器: Apprise 渠道 + 自定义渠道"""
 
-    def __init__(self):
+    def __init__(self, policy=None):
         self._ap = apprise.Apprise()
         self._custom_channels: list[tuple[str, dict]] = []
         self._channel_count = 0
         # 钉钉关键字（可选）：若群机器人启用“关键字”安全校验，则自动附加
         self._dingtalk_keywords: set[str] = set()
+        self.policy = policy
 
     def add_channel(self, channel_type: str, config: dict):
         """添加通知渠道"""
@@ -216,11 +235,28 @@ class NotifierManager:
         """向所有已注册渠道发送通知（忽略错误）"""
         await self.notify_with_result(title, content, images)
 
-    async def notify_with_result(self, title: str, content: str, images: list[str] | None = None) -> dict:
+    async def notify_with_result(
+        self,
+        title: str,
+        content: str,
+        images: list[str] | None = None,
+        *,
+        bypass_quiet_hours: bool = False,
+    ) -> dict:
         """向所有已注册渠道发送通知，返回结果"""
         if self._channel_count == 0:
             logger.warning("没有可用的通知渠道")
             return {"success": False, "error": "没有可用的通知渠道"}
+
+        # Quiet hours
+        try:
+            if not bypass_quiet_hours and getattr(self, "policy", None):
+                if self.policy.is_quiet_now():
+                    logger.info("当前处于通知静默时段，跳过发送")
+                    return {"success": False, "skipped": "quiet_hours"}
+        except Exception:
+            # do not block sends on policy errors
+            pass
 
         # 准备纯文本版本（用于不支持 Markdown 的渠道）
         plain_content = sanitize_for_telegram(content)
@@ -243,36 +279,67 @@ class NotifierManager:
             if suffix.strip() not in content:
                 content = (content + "\n" + suffix).strip()
 
+        retry_attempts = 0
+        backoff = 0.0
+        try:
+            if getattr(self, "policy", None):
+                retry_attempts = max(0, int(self.policy.retry_attempts))
+                backoff = float(self.policy.retry_backoff_seconds or 0.0)
+        except Exception:
+            retry_attempts = 0
+            backoff = 0.0
+
+        async def _sleep_retry(i: int):
+            if backoff <= 0:
+                return
+            await asyncio.sleep(backoff * (2 ** max(0, i - 1)))
+
         # Apprise 渠道（使用纯文本，因为 Telegram 等不支持 Markdown）
         if len(self._ap) > 0:
-            try:
-                success = await self._ap.async_notify(
-                    title=title,
-                    body=plain_content,
-                    body_format=apprise.NotifyFormat.TEXT,
-                    attach=attachments,
-                )
-                if success:
-                    logger.info(f"Apprise 通知发送成功: {title}")
-                else:
-                    error_msg = "Apprise 通知发送失败（可能是网络问题或配置错误）"
-                    logger.error(f"{error_msg}: {title}")
-                    errors.append(error_msg)
-            except Exception as e:
-                error_msg = f"Apprise 通知异常: {e}"
-                logger.error(error_msg)
-                errors.append(error_msg)
+            apprise_ok = False
+            last_err = ""
+            for attempt in range(0, retry_attempts + 1):
+                try:
+                    success = await self._ap.async_notify(
+                        title=title,
+                        body=plain_content,
+                        body_format=apprise.NotifyFormat.TEXT,
+                        attach=attachments,
+                    )
+                    if success:
+                        apprise_ok = True
+                        logger.info(f"Apprise 通知发送成功: {title}")
+                        break
+                    last_err = "Apprise 通知发送失败（可能是网络问题或配置错误）"
+                    logger.error(f"{last_err}: {title}")
+                except Exception as e:
+                    last_err = f"Apprise 通知异常: {e}"
+                    logger.error(last_err)
+                if attempt < retry_attempts:
+                    await _sleep_retry(attempt + 1)
+            if not apprise_ok:
+                errors.append(last_err or "Apprise 通知发送失败")
 
         # 自定义渠道（根据渠道类型自动选择格式）
         for ch_type, config in self._custom_channels:
-            try:
-                # 支持 Markdown 的渠道使用原始内容，否则使用纯文本
-                ch_content = content if ch_type in _MARKDOWN_CHANNELS else plain_content
-                await self._send_custom(ch_type, config, title, ch_content)
-            except Exception as e:
-                error_msg = f"{ch_type} 发送失败: {e}"
-                logger.error(error_msg)
-                errors.append(error_msg)
+            ch_ok = False
+            last_err = ""
+            for attempt in range(0, retry_attempts + 1):
+                try:
+                    # 支持 Markdown 的渠道使用原始内容，否则使用纯文本
+                    ch_content = (
+                        content if ch_type in _MARKDOWN_CHANNELS else plain_content
+                    )
+                    await self._send_custom(ch_type, config, title, ch_content)
+                    ch_ok = True
+                    break
+                except Exception as e:
+                    last_err = f"{ch_type} 发送失败: {e}"
+                    logger.error(last_err)
+                if attempt < retry_attempts:
+                    await _sleep_retry(attempt + 1)
+            if not ch_ok:
+                errors.append(last_err or f"{ch_type} 发送失败")
 
         if errors:
             return {"success": False, "error": "; ".join(errors)}
@@ -330,7 +397,10 @@ class NotifierManager:
         except httpx.TimeoutException:
             raise RuntimeError("请求超时（网络问题或代理配置错误）")
         except Exception as e:
-            if "ConnectError" in str(type(e).__name__) or "connection" in str(e).lower():
+            if (
+                "ConnectError" in str(type(e).__name__)
+                or "connection" in str(e).lower()
+            ):
                 if not proxy:
                     raise RuntimeError(f"网络连接失败，建议配置代理: {e}")
             raise

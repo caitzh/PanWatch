@@ -9,6 +9,8 @@ import asyncio
 
 import httpx
 
+from src.core.cn_symbol import get_cn_prefix
+
 logger = logging.getLogger(__name__)
 
 # 简单内存缓存（5分钟过期）
@@ -80,14 +82,12 @@ class XueqiuNewsCollector(BaseNewsCollector):
 
     def _get_symbol_id(self, symbol: str) -> str:
         """转换为雪球 symbol_id 格式"""
-        # 5开头（ETF）、6开头（主板）、9开头（B股）→上交所SH
-        if symbol.startswith(("5", "6", "9")):
-            return f"SH{symbol}"
-        # 0/1/2/3开头→深交所SZ（包括159/160开头的深交所ETF）
-        elif symbol.startswith(("0", "1", "2", "3")):
-            return f"SZ{symbol}"
-        else:
-            return symbol
+        if len(symbol) == 6 and symbol.isdigit():
+            prefix = get_cn_prefix(symbol, upper=True)
+            # 雪球 A 股新闻接口仅识别 SH/SZ，BJ 代码保留原值
+            if prefix in {"SH", "SZ"}:
+                return f"{prefix}{symbol}"
+        return symbol
 
     async def fetch_news(self, symbols: list[str] | None = None, since: datetime | None = None) -> list[NewsItem]:
         """获取雪球个股新闻（并发请求）"""

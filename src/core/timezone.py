@@ -1,8 +1,22 @@
-"""时区处理工具 - 统一时间存储和显示"""
-from datetime import datetime, timezone, timedelta
+"""时区处理工具 - 统一时间存储和显示。
 
-# 北京时间 UTC+8
-BEIJING_TZ = timezone(timedelta(hours=8))
+默认时区可通过环境变量覆盖：
+- TZ（推荐）
+
+未设置时默认 Asia/Shanghai。
+"""
+
+from datetime import datetime, timezone
+import os
+from zoneinfo import ZoneInfo
+
+
+def _get_app_tz() -> ZoneInfo:
+    tz_name = os.environ.get("TZ") or os.environ.get("APP_TIMEZONE") or "Asia/Shanghai"
+    try:
+        return ZoneInfo(tz_name)
+    except Exception:
+        return ZoneInfo("UTC")
 
 
 def utc_now() -> datetime:
@@ -11,28 +25,28 @@ def utc_now() -> datetime:
 
 
 def beijing_now() -> datetime:
-    """获取当前北京时间（带时区信息）"""
-    return datetime.now(BEIJING_TZ)
+    """获取当前默认时区时间（历史命名保留；带时区信息）"""
+    return datetime.now(_get_app_tz())
 
 
 def to_utc(dt: datetime) -> datetime:
     """将时间转换为 UTC"""
     if dt.tzinfo is None:
-        # 假设无时区的时间是北京时间
-        dt = dt.replace(tzinfo=BEIJING_TZ)
+        # 假设无时区的时间是默认时区
+        dt = dt.replace(tzinfo=_get_app_tz())
     return dt.astimezone(timezone.utc)
 
 
 def to_beijing(dt: datetime) -> datetime:
-    """将时间转换为北京时间"""
+    """将时间转换为默认时区（历史命名保留）"""
     if dt.tzinfo is None:
         # 假设无时区的时间是 UTC
         dt = dt.replace(tzinfo=timezone.utc)
-    return dt.astimezone(BEIJING_TZ)
+    return dt.astimezone(_get_app_tz())
 
 
 def format_beijing(dt: datetime, fmt: str = "%Y-%m-%d %H:%M:%S") -> str:
-    """格式化为北京时间字符串"""
+    """格式化为默认时区字符串（历史命名保留）"""
     return to_beijing(dt).strftime(fmt)
 
 

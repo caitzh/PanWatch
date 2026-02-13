@@ -69,10 +69,13 @@
 
 @layer components {
   .card {
-    @apply bg-card rounded-xl border border-border;
+    @apply bg-card rounded-xl border border-border/60 shadow-[0_1px_0_hsl(var(--border)/0.35)];
   }
   .card-hover {
-    @apply bg-card rounded-xl border border-border hover:border-primary/30 transition-colors;
+    @apply bg-card rounded-xl border border-border/60 hover:border-primary/30 hover:shadow-[0_10px_30px_-26px_hsl(var(--primary)/0.55)] transition-all;
+  }
+  .card-subtle {
+    @apply rounded-xl border border-border/40 bg-accent/20;
   }
   .btn-primary {
     @apply inline-flex items-center justify-center gap-2 px-4 py-2.5 bg-primary text-primary-foreground rounded-lg text-[13px] font-semibold hover:bg-primary/90 active:scale-[0.98] transition-all;
@@ -98,8 +101,8 @@
   }
 
   .scrollbar::-webkit-scrollbar {
-    width: 10px;
-    height: 10px;
+    width: 8px;
+    height: 8px;
   }
 
   .scrollbar::-webkit-scrollbar-track {
@@ -107,14 +110,14 @@
   }
 
   .scrollbar::-webkit-scrollbar-thumb {
-    background-color: hsl(var(--muted-foreground) / 0.28);
+    background-color: hsl(var(--muted-foreground) / 0.22);
     border-radius: 9999px;
     border: 2px solid transparent;
     background-clip: content-box;
   }
 
   .scrollbar::-webkit-scrollbar-thumb:hover {
-    background-color: hsl(var(--muted-foreground) / 0.45);
+    background-color: hsl(var(--muted-foreground) / 0.38);
   }
 
   .scrollbar::-webkit-scrollbar-corner {

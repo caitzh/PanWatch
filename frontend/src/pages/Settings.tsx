@@ -1,18 +1,44 @@
-import { useState, useEffect } from 'react'
-import { Check, Eye, EyeOff, Plus, Pencil, Trash2, Star, Send, Cpu, Play } from 'lucide-react'
-import { fetchAPI, type AIService, type AIModel, type NotifyChannel } from '@/lib/utils'
-import { Input } from '@/components/ui/input'
-import { Label } from '@/components/ui/label'
-import { Button } from '@/components/ui/button'
-import { Switch } from '@/components/ui/switch'
-import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription } from '@/components/ui/dialog'
-import { Select, SelectTrigger, SelectValue, SelectContent, SelectItem } from '@/components/ui/select'
-import { useToast } from '@/components/ui/toast'
+import { useState, useEffect, useRef } from 'react'
+import { Check, Eye, EyeOff, Plus, Pencil, Trash2, Star, Send, Cpu, Play, Download, Upload, FileJson, BarChart3, TrendingUp } from 'lucide-react'
+import { fetchAPI, type AIService, type AIModel, type NotifyChannel } from '@panwatch/api'
+import { Input } from '@panwatch/base-ui/components/ui/input'
+import { Label } from '@panwatch/base-ui/components/ui/label'
+import { Button } from '@panwatch/base-ui/components/ui/button'
+import { Switch } from '@panwatch/base-ui/components/ui/switch'
+import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription } from '@panwatch/base-ui/components/ui/dialog'
+import { Select, SelectTrigger, SelectValue, SelectContent, SelectItem } from '@panwatch/base-ui/components/ui/select'
+import { useToast } from '@panwatch/base-ui/components/ui/toast'
 
 interface Setting {
   key: string
   value: string
   description: string
+}
+
+interface TemplatePayload {
+  version: number
+  exported_at?: string
+  settings?: Record<string, string>
+  agents?: any[]
+  stocks?: any[]
+}
+
+interface FeedbackStats {
+  range_days: number
+  total: number
+  useful: number
+  useless: number
+  useful_rate: number
+  by_day: Array<{ day: string; total: number; useful: number; useless: number; useful_rate: number }>
+  by_agent: Array<{ agent_name: string; total: number; useful: number; useless: number; useful_rate: number }>
+}
+
+interface AgentsHealth {
+  timezone: string
+  summary: {
+    next_24h_count: number
+    recent_failed_count: number
+  }
 }
 
 interface ServiceForm {
@@ -25,7 +51,6 @@ interface ModelForm {
   name: string
   service_id: number | null
   model: string
-  enable_thinking: boolean
 }
 
 interface ChannelForm {
@@ -109,7 +134,7 @@ const CHANNEL_TYPE_FIELDS: Record<string, { label: string; fields: ChannelFieldD
 }
 
 const emptyServiceForm: ServiceForm = { name: '', base_url: '', api_key: '' }
-const emptyModelForm: ModelForm = { name: '', service_id: null, model: '', enable_thinking: false }
+const emptyModelForm: ModelForm = { name: '', service_id: null, model: '' }
 const emptyChannelForm: ChannelForm = { name: '', type: 'telegram', config: {} }
 
 export default function SettingsPage() {
@@ -118,9 +143,12 @@ export default function SettingsPage() {
   const [channels, setChannels] = useState<NotifyChannel[]>([])
   const [version, setVersion] = useState<string>('')
   const [loading, setLoading] = useState(true)
+  const [health, setHealth] = useState<AgentsHealth | null>(null)
   const [saving, setSaving] = useState<string | null>(null)
   const [saved, setSaved] = useState<string | null>(null)
   const [edited, setEdited] = useState<Record<string, string>>({})
+
+  const [systemQuery, setSystemQuery] = useState('')
 
   // Service dialog
   const [serviceDialogOpen, setServiceDialogOpen] = useState(false)
@@ -141,27 +169,85 @@ export default function SettingsPage() {
   const [testing, setTesting] = useState<number | null>(null)
   const [testingModel, setTestingModel] = useState<number | null>(null)
 
-  // Password change dialog
-  const [passwordDialogOpen, setPasswordDialogOpen] = useState(false)
-  const [newPassword, setNewPassword] = useState('')
-  const [confirmPassword, setConfirmPassword] = useState('')
-  const [passwordVisible, setPasswordVisible] = useState(false)
-  const [changingPassword, setChangingPassword] = useState(false)
+  // Templates (config pack)
+  const [importMode, setImportMode] = useState<'merge' | 'replace'>('merge')
+  const [importing, setImporting] = useState(false)
+  const [exporting, setExporting] = useState(false)
+
+  // Feedback stats
+  const [fbStats, setFbStats] = useState<FeedbackStats | null>(null)
+  const [fbLoading, setFbLoading] = useState(false)
+
+  const importFileRef = useRef<HTMLInputElement | null>(null)
 
   const { toast } = useToast()
 
+  const builtinTemplates: Array<{ name: string; desc: string; payload: TemplatePayload }> = [
+    {
+      name: '保守',
+      desc: '低打扰：盘中更严格触发，静默时段建议开启',
+      payload: {
+        version: 1,
+        settings: {
+          notify_quiet_hours: '23:00-07:00',
+          notify_retry_attempts: '2',
+          notify_retry_backoff_seconds: '2',
+        },
+        agents: [
+          { name: 'premarket_outlook', enabled: true, schedule: '30 8 * * 1-5', execution_mode: 'batch' },
+          { name: 'daily_report', enabled: true, schedule: '30 15 * * 1-5', execution_mode: 'batch' },
+          { name: 'intraday_monitor', enabled: true, schedule: '*/10 9-15 * * 1-5', execution_mode: 'single', config: { event_only: true, price_alert_threshold: 4.0, volume_alert_ratio: 2.5, throttle_minutes: 45 } },
+        ],
+      },
+    },
+    {
+      name: '均衡',
+      desc: '默认推荐：兼顾覆盖与打扰',
+      payload: {
+        version: 1,
+        settings: {
+          notify_retry_attempts: '2',
+          notify_retry_backoff_seconds: '2',
+        },
+        agents: [
+          { name: 'premarket_outlook', enabled: true, schedule: '30 8 * * 1-5', execution_mode: 'batch' },
+          { name: 'daily_report', enabled: true, schedule: '30 15 * * 1-5', execution_mode: 'batch' },
+          { name: 'intraday_monitor', enabled: true, schedule: '*/5 9-15 * * 1-5', execution_mode: 'single', config: { event_only: true, price_alert_threshold: 3.0, volume_alert_ratio: 2.0, throttle_minutes: 30 } },
+        ],
+      },
+    },
+    {
+      name: '激进',
+      desc: '更高频：更早捕捉变化，适合短线盯盘',
+      payload: {
+        version: 1,
+        settings: {
+          notify_retry_attempts: '3',
+          notify_retry_backoff_seconds: '1',
+        },
+        agents: [
+          { name: 'premarket_outlook', enabled: true, schedule: '10 8 * * 1-5', execution_mode: 'batch' },
+          { name: 'daily_report', enabled: true, schedule: '10 15 * * 1-5', execution_mode: 'batch' },
+          { name: 'intraday_monitor', enabled: true, schedule: '*/3 9-15 * * 1-5', execution_mode: 'single', config: { event_only: true, price_alert_threshold: 2.0, volume_alert_ratio: 1.8, throttle_minutes: 20 } },
+        ],
+      },
+    },
+  ]
+
   const load = async () => {
     try {
-      const [settingsData, servicesData, channelsData, versionData] = await Promise.all([
+      const [settingsData, servicesData, channelsData, versionData, healthData] = await Promise.all([
         fetchAPI<Setting[]>('/settings'),
         fetchAPI<AIService[]>('/providers/services'),
         fetchAPI<NotifyChannel[]>('/channels'),
         fetchAPI<{ version: string }>('/settings/version'),
+        fetchAPI<AgentsHealth>('/agents/health'),
       ])
       setSettings(settingsData)
       setServices(servicesData)
       setChannels(channelsData)
       setVersion(versionData.version)
+      setHealth(healthData)
     } catch (e) {
       console.error(e)
     } finally {
@@ -169,7 +255,69 @@ export default function SettingsPage() {
     }
   }
 
-  useEffect(() => { load() }, [])
+  const downloadJson = (name: string, obj: any) => {
+    try {
+      const blob = new Blob([JSON.stringify(obj, null, 2)], { type: 'application/json' })
+      const url = URL.createObjectURL(blob)
+      const a = document.createElement('a')
+      a.href = url
+      a.download = name
+      document.body.appendChild(a)
+      a.click()
+      a.remove()
+      URL.revokeObjectURL(url)
+    } catch {
+      // ignore
+    }
+  }
+
+  const exportTemplate = async () => {
+    setExporting(true)
+    try {
+      const data = await fetchAPI<TemplatePayload>('/templates/export')
+      const date = new Date().toISOString().slice(0, 10)
+      downloadJson(`panwatch-config-${date}.json`, data)
+      toast('配置包已导出', 'success')
+    } catch (e) {
+      toast(e instanceof Error ? e.message : '导出失败', 'error')
+    } finally {
+      setExporting(false)
+    }
+  }
+
+  const importTemplate = async (payload: TemplatePayload) => {
+    setImporting(true)
+    try {
+      const resp = await fetchAPI<any>(`/templates/import?mode=${importMode}`, {
+        method: 'POST',
+        body: JSON.stringify(payload),
+      })
+      toast('配置包已导入', 'success')
+      // refresh
+      await load()
+      return resp
+    } catch (e) {
+      toast(e instanceof Error ? e.message : '导入失败', 'error')
+      return null
+    } finally {
+      setImporting(false)
+    }
+  }
+
+  const loadFeedbackStats = async () => {
+    setFbLoading(true)
+    try {
+      const stats = await fetchAPI<FeedbackStats>('/feedback/stats?days=14')
+      setFbStats(stats)
+    } catch (e) {
+      console.error(e)
+      setFbStats(null)
+    } finally {
+      setFbLoading(false)
+    }
+  }
+
+  useEffect(() => { load(); loadFeedbackStats() }, [])
 
   const handleSave = async (key: string) => {
     setSaving(key)
@@ -231,12 +379,7 @@ export default function SettingsPage() {
   // Model CRUD
   const openModelDialog = (serviceId?: number, model?: AIModel) => {
     if (model) {
-      setModelForm({
-        name: model.name,
-        service_id: model.service_id,
-        model: model.model,
-        enable_thinking: (model.extra_params?.enable_thinking as boolean) ?? false
-      })
+      setModelForm({ name: model.name, service_id: model.service_id, model: model.model })
       setEditModelId(model.id)
     } else {
       setModelForm({ ...emptyModelForm, service_id: serviceId ?? null })
@@ -247,16 +390,10 @@ export default function SettingsPage() {
 
   const saveModel = async () => {
     try {
-      const payload = {
-        name: modelForm.name,
-        service_id: modelForm.service_id,
-        model: modelForm.model,
-        extra_params: { enable_thinking: modelForm.enable_thinking }
-      }
       if (editModelId) {
-        await fetchAPI(`/providers/models/${editModelId}`, { method: 'PUT', body: JSON.stringify(payload) })
+        await fetchAPI(`/providers/models/${editModelId}`, { method: 'PUT', body: JSON.stringify(modelForm) })
       } else {
-        await fetchAPI('/providers/models', { method: 'POST', body: JSON.stringify(payload) })
+        await fetchAPI('/providers/models', { method: 'POST', body: JSON.stringify(modelForm) })
       }
       setModelDialogOpen(false)
       load()
@@ -369,33 +506,6 @@ export default function SettingsPage() {
     }
   }
 
-  const changePassword = async () => {
-    if (newPassword.length < 6) {
-      toast('密码长度至少 6 位', 'error')
-      return
-    }
-    if (newPassword !== confirmPassword) {
-      toast('两次输入的密码不一致', 'error')
-      return
-    }
-
-    setChangingPassword(true)
-    try {
-      await fetchAPI('/auth/change-password', {
-        method: 'POST',
-        body: JSON.stringify({ username: '', password: newPassword })
-      })
-      toast('密码已更新', 'success')
-      setPasswordDialogOpen(false)
-      setNewPassword('')
-      setConfirmPassword('')
-    } catch (e) {
-      toast(e instanceof Error ? e.message : '修改失败', 'error')
-    } finally {
-      setChangingPassword(false)
-    }
-  }
-
   const testChannel = async (id: number) => {
     setTesting(id)
     try {
@@ -416,18 +526,113 @@ export default function SettingsPage() {
     )
   }
 
+  const allModels = services.flatMap(s => s.models || [])
+  const defaultModel = allModels.find(m => m.is_default)
+  const defaultChannel = channels.find(c => c.is_default)
+  const enabledChannels = channels.filter(c => c.enabled)
+
+  const filteredSettings = settings.filter(s => {
+    const q = systemQuery.trim().toLowerCase()
+    if (!q) return true
+    return (s.description || '').toLowerCase().includes(q) || (s.key || '').toLowerCase().includes(q)
+  })
+
+  // 按“重要性”排序：常用优先，低频靠后
+  const jumpItems: Array<{ id: string; label: string; hint?: string }> = [
+    { id: 'sec-ai', label: 'AI', hint: `${services.length} 服务 / ${allModels.length} 模型` },
+    { id: 'sec-notify', label: '通知', hint: `${enabledChannels.length}/${channels.length} 启用` },
+    { id: 'sec-system', label: '系统', hint: health?.timezone ? `TZ ${health.timezone}` : undefined },
+    { id: 'sec-pack', label: '配置包' },
+    { id: 'sec-feedback', label: '反馈' },
+  ]
+
+  const scrollTo = (id: string) => {
+    const el = document.getElementById(id)
+    if (!el) return
+    el.scrollIntoView({ behavior: 'smooth', block: 'start' })
+  }
+
   return (
     <div>
-      <div className="mb-4 md:mb-8">
-        <h1 className="text-[20px] md:text-[22px] font-bold text-foreground tracking-tight">设置</h1>
-        <p className="text-[12px] md:text-[13px] text-muted-foreground mt-0.5 md:mt-1">AI 服务商、模型、通知渠道与系统配置</p>
+      {/* Hero */}
+      <div className="card relative overflow-hidden p-5 md:p-7">
+        <div className="pointer-events-none absolute inset-0 bg-gradient-to-br from-primary/10 via-transparent to-accent/30" />
+        <div className="relative flex flex-col md:flex-row md:items-end md:justify-between gap-4">
+          <div className="min-w-0">
+            <div className="flex items-center gap-2 text-[11px] text-muted-foreground">
+              <div className="h-8 w-8 rounded-2xl bg-gradient-to-br from-primary to-primary/70 text-white shadow-sm flex items-center justify-center">
+                <TrendingUp className="w-4 h-4" />
+              </div>
+              <div className="min-w-0">
+                <div className="flex items-center gap-2">
+                  <span className="font-mono text-foreground/90">PanWatch</span>
+                  <span className="rounded-full border border-border/50 bg-background/70 px-2 py-0.5 text-[10px] text-muted-foreground">Console</span>
+                </div>
+              </div>
+              {version ? <span className="opacity-60">v{version}</span> : null}
+              {health?.timezone ? (
+                <span className="opacity-60">TZ {health.timezone}</span>
+              ) : null}
+            </div>
+            <h1 className="mt-1 text-[22px] md:text-[26px] font-bold text-foreground tracking-tight">设置</h1>
+            <p className="mt-1 text-[12px] md:text-[13px] text-muted-foreground">AI、通知与系统偏好。把“信息密度”和“打扰”调到你的手感。</p>
+
+            <div className="mt-3 flex flex-wrap items-center gap-2">
+              <div className="px-2.5 py-1 rounded-full bg-background/70 border border-border/50 text-[11px] text-muted-foreground">
+                <span className="font-mono text-foreground/90">{services.length}</span> 服务商
+              </div>
+              <div className="px-2.5 py-1 rounded-full bg-background/70 border border-border/50 text-[11px] text-muted-foreground">
+                <span className="font-mono text-foreground/90">{allModels.length}</span> 模型
+              </div>
+              <div className="px-2.5 py-1 rounded-full bg-background/70 border border-border/50 text-[11px] text-muted-foreground">
+                <span className="font-mono text-foreground/90">{enabledChannels.length}</span>/<span className="font-mono">{channels.length}</span> 渠道启用
+              </div>
+              {defaultModel ? (
+                <div className="px-2.5 py-1 rounded-full bg-background/70 border border-border/50 text-[11px] text-muted-foreground">
+                  默认模型 <span className="font-mono text-foreground/90">{defaultModel.model}</span>
+                </div>
+              ) : null}
+              {defaultChannel ? (
+                <div className="px-2.5 py-1 rounded-full bg-background/70 border border-border/50 text-[11px] text-muted-foreground">
+                  默认通知 <span className="text-foreground/90">{defaultChannel.name}</span>
+                </div>
+              ) : null}
+            </div>
+          </div>
+
+          <div className="flex flex-col sm:flex-row gap-2">
+            <Button variant="secondary" size="sm" className="h-9" onClick={exportTemplate} disabled={exporting}>
+              <Download className="w-3.5 h-3.5" /> 导出配置包
+            </Button>
+            <Button size="sm" className="h-9" onClick={() => scrollTo('sec-ai')}>
+              <Cpu className="w-3.5 h-3.5" /> 配置 AI
+            </Button>
+          </div>
+        </div>
+
+        {/* Jump pills */}
+        <div className="relative mt-4 flex flex-wrap gap-2">
+          {jumpItems.map(it => (
+            <button
+              key={it.id}
+              onClick={() => scrollTo(it.id)}
+              className="group flex items-center gap-2 rounded-full border border-border/50 bg-background/70 px-3 py-1.5 text-[11px] text-muted-foreground hover:text-foreground hover:border-primary/30 transition-colors"
+            >
+              <span className="font-medium text-foreground/90 group-hover:text-foreground">{it.label}</span>
+              {it.hint ? <span className="opacity-60">{it.hint}</span> : null}
+            </button>
+          ))}
+        </div>
       </div>
 
-      <div className="space-y-6">
+      <div className="mt-6 grid grid-cols-1 lg:grid-cols-12 gap-6">
         {/* AI Services + Models Section */}
-        <section className="card p-4 md:p-6">
-          <div className="flex items-center justify-between mb-4 md:mb-5">
-            <h3 className="text-[12px] md:text-[13px] font-semibold text-foreground">AI 服务商 & 模型</h3>
+        <section id="sec-ai" className="card p-4 md:p-6 lg:col-span-7">
+          <div className="flex items-start justify-between mb-4 md:mb-5 gap-3">
+            <div>
+              <h3 className="text-[12px] md:text-[13px] font-semibold text-foreground">AI 服务商 & 模型</h3>
+              <p className="text-[11px] text-muted-foreground mt-1">连接你的 AI 服务并设置默认模型</p>
+            </div>
             <Button size="sm" className="h-8" onClick={() => openServiceDialog()}>
               <Plus className="w-3.5 h-3.5" />
               <span className="hidden sm:inline">添加服务商</span>
@@ -504,9 +709,12 @@ export default function SettingsPage() {
         </section>
 
         {/* Notify Channel Section */}
-        <section className="card p-4 md:p-6">
-          <div className="flex items-center justify-between mb-4 md:mb-5">
-            <h3 className="text-[12px] md:text-[13px] font-semibold text-foreground">通知渠道</h3>
+        <section id="sec-notify" className="card p-4 md:p-6 lg:col-span-5">
+          <div className="flex items-start justify-between mb-4 md:mb-5 gap-3">
+            <div>
+              <h3 className="text-[12px] md:text-[13px] font-semibold text-foreground">通知渠道</h3>
+              <p className="text-[11px] text-muted-foreground mt-1">推送到 Telegram/Bark 等渠道</p>
+            </div>
             <Button size="sm" className="h-8" onClick={() => openChannelDialog()}>
               <Plus className="w-3.5 h-3.5" />
               <span className="hidden sm:inline">添加</span>
@@ -559,10 +767,29 @@ export default function SettingsPage() {
 
         {/* General Settings */}
         {settings.length > 0 && (
-          <section className="card p-4 md:p-6">
-            <h3 className="text-[12px] md:text-[13px] font-semibold text-foreground mb-4 md:mb-5">系统</h3>
+          <section id="sec-system" className="card p-4 md:p-6 lg:col-span-12">
+            <div className="flex flex-col md:flex-row md:items-end md:justify-between gap-3 mb-4 md:mb-5">
+              <div>
+                <h3 className="text-[12px] md:text-[13px] font-semibold text-foreground">系统</h3>
+                <p className="text-[11px] text-muted-foreground mt-1">偏好与高级选项。修改后立即生效。</p>
+              </div>
+              <div className="flex items-center gap-2">
+                <Input
+                  value={systemQuery}
+                  onChange={e => setSystemQuery(e.target.value)}
+                  placeholder="搜索设置项（描述 / key）"
+                  className="h-9 w-full md:w-[320px]"
+                />
+                {health?.timezone ? (
+                  <div className="hidden md:flex px-2.5 h-9 items-center rounded-lg border border-border/50 bg-accent/20 text-[11px] text-muted-foreground">
+                    TZ <span className="ml-1 font-mono text-foreground/90">{health.timezone}</span>
+                  </div>
+                ) : null}
+              </div>
+            </div>
+
             <div className="space-y-5">
-              {settings.map(setting => {
+              {filteredSettings.map(setting => {
                 const currentValue = edited[setting.key] ?? setting.value
                 const isChanged = setting.key in edited
                 return (
@@ -600,24 +827,139 @@ export default function SettingsPage() {
           </section>
         )}
 
-        {/* Account Security */}
-        <section className="card p-4 md:p-6">
-          <h3 className="text-[12px] md:text-[13px] font-semibold text-foreground mb-4 md:mb-5">账号安全</h3>
-          <div className="space-y-4">
+        {/* Config Pack (Templates) */}
+        <section id="sec-pack" className="card p-4 md:p-6 lg:col-span-7">
+          <div className="flex items-start justify-between mb-4 gap-3">
             <div>
-              <Label>登录密码</Label>
-              <div className="flex items-center gap-2.5 mt-2">
-                <Input type="password" value="••••••••" disabled className="font-mono" />
-                <Button onClick={() => setPasswordDialogOpen(true)} variant="outline" size="sm">
-                  修改密码
-                </Button>
-              </div>
-              <p className="text-[11px] text-muted-foreground mt-1.5">
-                定期修改密码可提高账号安全性
-              </p>
+              <h3 className="text-[12px] md:text-[13px] font-semibold text-foreground">配置包</h3>
+              <p className="text-[11px] text-muted-foreground mt-1">一键导入/导出 Agent、关注列表与系统设置</p>
+            </div>
+            <div className="flex items-center gap-2">
+              <Button variant="secondary" size="sm" className="h-8" onClick={exportTemplate} disabled={exporting}>
+                <Download className="w-3.5 h-3.5" />
+                <span className="hidden sm:inline">导出</span>
+              </Button>
+              <Button
+                variant="secondary"
+                size="sm"
+                className="h-8"
+                onClick={() => importFileRef.current?.click()}
+                disabled={importing}
+              >
+                <Upload className="w-3.5 h-3.5" />
+                <span className="hidden sm:inline">导入</span>
+              </Button>
+            </div>
+          </div>
+
+          <div className="flex items-center gap-2 mb-4">
+            <div className="text-[11px] text-muted-foreground">导入模式</div>
+            <Select value={importMode} onValueChange={(v) => setImportMode(v as any)}>
+              <SelectTrigger className="h-8 w-[160px] text-[12px]">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="merge">合并更新（推荐）</SelectItem>
+                <SelectItem value="replace">替换（仅覆盖配置包包含项）</SelectItem>
+              </SelectContent>
+            </Select>
+          </div>
+
+          <input
+            ref={importFileRef}
+            type="file"
+            accept="application/json"
+            className="hidden"
+            onChange={async (e) => {
+              const file = e.target.files?.[0]
+              e.target.value = ''
+              if (!file) return
+              try {
+                const text = await file.text()
+                const payload = JSON.parse(text)
+                await importTemplate(payload)
+              } catch (err) {
+                toast('配置包解析失败', 'error')
+              }
+            }}
+          />
+
+          <div className="rounded-xl border border-border/40 bg-accent/20 p-3">
+            <div className="flex items-center gap-2 text-[12px] font-semibold text-foreground">
+              <FileJson className="w-4 h-4 text-muted-foreground" />
+              官方模板
+            </div>
+            <div className="mt-2 grid grid-cols-1 md:grid-cols-3 gap-2">
+              {builtinTemplates.map(t => (
+                <div key={t.name} className="rounded-lg border border-border/40 bg-background/30 p-3">
+                  <div className="flex items-center justify-between">
+                    <div className="text-[12px] font-semibold text-foreground">{t.name}</div>
+                    <Button
+                      size="sm"
+                      className="h-7"
+                      onClick={() => importTemplate(t.payload)}
+                      disabled={importing}
+                    >
+                      <span className="text-[12px]">应用</span>
+                    </Button>
+                  </div>
+                  <div className="mt-1 text-[11px] text-muted-foreground">{t.desc}</div>
+                </div>
+              ))}
             </div>
           </div>
         </section>
+
+        {/* Feedback Stats */}
+        <section id="sec-feedback" className="card p-4 md:p-6 lg:col-span-5">
+          <div className="flex items-center justify-between mb-4">
+            <div>
+              <h3 className="text-[12px] md:text-[13px] font-semibold text-foreground">建议反馈</h3>
+              <p className="text-[11px] text-muted-foreground mt-1">用于评估推送质量与策略迭代</p>
+            </div>
+            <Button variant="secondary" size="sm" className="h-8" onClick={loadFeedbackStats} disabled={fbLoading}>
+              <BarChart3 className="w-3.5 h-3.5" />
+              <span className="hidden sm:inline">刷新</span>
+            </Button>
+          </div>
+
+          {fbStats ? (
+            <div className="space-y-3">
+              <div className="flex flex-wrap items-center gap-2 text-[12px] text-muted-foreground">
+                <span>近 {fbStats.range_days} 天</span>
+                <span className="opacity-50">|</span>
+                <span>反馈: <span className="font-mono text-foreground/90">{fbStats.total}</span></span>
+                <span className="opacity-50">|</span>
+                <span>有用: <span className="font-mono text-emerald-600">{fbStats.useful}</span></span>
+                <span className="opacity-50">|</span>
+                <span>没用: <span className="font-mono text-rose-600">{fbStats.useless}</span></span>
+                <span className="opacity-50">|</span>
+                <span>有用率: <span className="font-mono text-foreground/90">{Math.round(fbStats.useful_rate * 100)}%</span></span>
+              </div>
+
+              {fbStats.by_agent?.length ? (
+                <div className="rounded-xl border border-border/40 bg-accent/20 p-3">
+                  <div className="text-[12px] font-semibold text-foreground">按 Agent</div>
+                  <div className="mt-2 space-y-1">
+                    {fbStats.by_agent.slice(0, 6).map(a => (
+                      <div key={a.agent_name} className="flex items-center justify-between text-[11px]">
+                        <span className="font-mono text-muted-foreground">{a.agent_name}</span>
+                        <span className="font-mono text-muted-foreground">
+                          {a.useful}/{a.total} ({Math.round(a.useful_rate * 100)}%)
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              ) : (
+                <div className="text-[12px] text-muted-foreground">暂无反馈数据</div>
+              )}
+            </div>
+          ) : (
+            <div className="text-[12px] text-muted-foreground">暂无反馈数据</div>
+          )}
+        </section>
+
       </div>
 
       {/* Service Dialog */}
@@ -711,18 +1053,8 @@ export default function SettingsPage() {
               <Input
                 value={modelForm.model}
                 onChange={e => setModelForm({ ...modelForm, model: e.target.value })}
-                placeholder="gpt-4o / glm-4-flash / kimi-k2.5"
+                placeholder="gpt-4o / glm-4-flash"
                 className="font-mono"
-              />
-            </div>
-            <div className="flex items-center justify-between py-2">
-              <div className="space-y-0.5">
-                <Label className="text-sm">开启思维链 (CoT)</Label>
-                <p className="text-[11px] text-muted-foreground">适用于 DeepSeek-R1、Kimi-K2.5 等支持思维链的模型</p>
-              </div>
-              <Switch
-                checked={modelForm.enable_thinking}
-                onCheckedChange={checked => setModelForm({ ...modelForm, enable_thinking: checked })}
               />
             </div>
             <div className="flex justify-end gap-2 pt-2">
@@ -797,68 +1129,6 @@ export default function SettingsPage() {
               <Button variant="ghost" onClick={() => setChannelDialogOpen(false)}>取消</Button>
               <Button onClick={saveChannel} disabled={!isChannelFormValid()}>
                 {editChannelId ? '保存' : '创建'}
-              </Button>
-            </div>
-          </div>
-        </DialogContent>
-      </Dialog>
-
-      {/* Password Change Dialog */}
-      <Dialog open={passwordDialogOpen} onOpenChange={setPasswordDialogOpen}>
-        <DialogContent>
-          <DialogHeader>
-            <DialogTitle>修改密码</DialogTitle>
-            <DialogDescription>设置新的登录密码</DialogDescription>
-          </DialogHeader>
-          <div className="space-y-4 mt-2">
-            <div>
-              <Label>新密码</Label>
-              <div className="relative">
-                <Input
-                  type={passwordVisible ? 'text' : 'password'}
-                  value={newPassword}
-                  onChange={e => setNewPassword(e.target.value)}
-                  placeholder="至少 6 位"
-                  className="pr-10"
-                />
-                <Button
-                  type="button"
-                  variant="ghost"
-                  size="icon"
-                  className="absolute right-1 top-1/2 -translate-y-1/2 h-8 w-8"
-                  onClick={() => setPasswordVisible(!passwordVisible)}
-                >
-                  {passwordVisible ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
-                </Button>
-              </div>
-            </div>
-            <div>
-              <Label>确认新密码</Label>
-              <Input
-                type={passwordVisible ? 'text' : 'password'}
-                value={confirmPassword}
-                onChange={e => setConfirmPassword(e.target.value)}
-                placeholder="再次输入新密码"
-                onKeyPress={e => e.key === 'Enter' && changePassword()}
-              />
-            </div>
-            <div className="flex justify-end gap-2 pt-2">
-              <Button 
-                variant="ghost" 
-                onClick={() => {
-                  setPasswordDialogOpen(false)
-                  setNewPassword('')
-                  setConfirmPassword('')
-                  setPasswordVisible(false)
-                }}
-              >
-                取消
-              </Button>
-              <Button 
-                onClick={changePassword} 
-                disabled={changingPassword || !newPassword || !confirmPassword}
-              >
-                {changingPassword ? '修改中...' : '确认修改'}
               </Button>
             </div>
           </div>

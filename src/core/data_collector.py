@@ -1,4 +1,5 @@
 """统一数据源管理器"""
+
 import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
@@ -15,6 +16,7 @@ logger = logging.getLogger(__name__)
 @dataclass
 class CollectorResult:
     """采集结果"""
+
     success: bool
     data: Any = None
     count: int = 0
@@ -27,6 +29,7 @@ class CollectorResult:
 @dataclass
 class CollectorLog:
     """采集日志"""
+
     timestamp: datetime
     source_name: str
     source_type: str
@@ -56,15 +59,20 @@ class DataCollectorManager:
     def _register_collectors(self):
         """注册所有采集器"""
         from src.collectors.news_collector import (
-            XueqiuNewsCollector, EastMoneyStockNewsCollector, EastMoneyNewsCollector
+            XueqiuNewsCollector,
+            EastMoneyStockNewsCollector,
+            EastMoneyNewsCollector,
         )
         from src.collectors.kline_collector import KlineCollector
         from src.collectors.capital_flow_collector import CapitalFlowCollector
         from src.collectors.akshare_collector import AkshareCollector
+        from src.collectors.events_collector import EastMoneyEventsCollector
 
         self.COLLECTOR_FACTORIES = {
             "news": {
-                "xueqiu": lambda cfg: XueqiuNewsCollector(cookies=cfg.get("cookies", "")),
+                "xueqiu": lambda cfg: XueqiuNewsCollector(
+                    cookies=cfg.get("cookies", "")
+                ),
                 "eastmoney_news": lambda cfg: EastMoneyStockNewsCollector(),
                 "eastmoney": lambda cfg: EastMoneyNewsCollector(),
             },
@@ -81,10 +89,20 @@ class DataCollectorManager:
                 "xueqiu": lambda cfg: ("xueqiu", cfg),
                 "eastmoney": lambda cfg: ("eastmoney", cfg),
             },
+            "events": {
+                "eastmoney": lambda cfg: EastMoneyEventsCollector(),
+            },
         }
 
-    def _log(self, source_name: str, source_type: str, action: str, message: str,
-             duration_ms: int = 0, count: int = 0):
+    def _log(
+        self,
+        source_name: str,
+        source_type: str,
+        action: str,
+        message: str,
+        duration_ms: int = 0,
+        count: int = 0,
+    ):
         """记录日志"""
         log = CollectorLog(
             timestamp=datetime.now(),
@@ -174,7 +192,9 @@ class DataCollectorManager:
         finally:
             db.close()
 
-    async def collect_news(self, symbols: list[str], hours: int = 12) -> CollectorResult:
+    async def collect_news(
+        self, symbols: list[str], hours: int = 12
+    ) -> CollectorResult:
         """采集新闻（使用所有已启用的新闻数据源）"""
         from src.collectors.news_collector import NewsCollector
 
@@ -186,9 +206,14 @@ class DataCollectorManager:
             news_list = await collector.fetch_all(symbols=symbols, since_hours=hours)
 
             duration_ms = int((datetime.now() - start_time).total_seconds() * 1000)
-            self._log("新闻采集", "news", "success",
-                      f"采集完成，共 {len(news_list)} 条",
-                      duration_ms=duration_ms, count=len(news_list))
+            self._log(
+                "新闻采集",
+                "news",
+                "success",
+                f"采集完成，共 {len(news_list)} 条",
+                duration_ms=duration_ms,
+                count=len(news_list),
+            )
 
             return CollectorResult(
                 success=True,
@@ -201,7 +226,9 @@ class DataCollectorManager:
             self._log("新闻采集", "news", "error", str(e), duration_ms=duration_ms)
             return CollectorResult(success=False, error=str(e), duration_ms=duration_ms)
 
-    async def collect_kline(self, symbol: str, market: str = "CN", days: int = 60) -> CollectorResult:
+    async def collect_kline(
+        self, symbol: str, market: str = "CN", days: int = 60
+    ) -> CollectorResult:
         """采集 K 线数据"""
         from src.collectors.kline_collector import KlineCollector
         from src.models.market import MarketCode
@@ -217,12 +244,24 @@ class DataCollectorManager:
             duration_ms = int((datetime.now() - start_time).total_seconds() * 1000)
 
             if summary.get("error"):
-                self._log("K线数据", "kline", "error", summary["error"], duration_ms=duration_ms)
-                return CollectorResult(success=False, error=summary["error"], duration_ms=duration_ms)
+                self._log(
+                    "K线数据",
+                    "kline",
+                    "error",
+                    summary["error"],
+                    duration_ms=duration_ms,
+                )
+                return CollectorResult(
+                    success=False, error=summary["error"], duration_ms=duration_ms
+                )
 
-            self._log("K线数据", "kline", "success",
-                      f"获取成功，最新收盘价 {summary.get('last_close', 'N/A')}",
-                      duration_ms=duration_ms)
+            self._log(
+                "K线数据",
+                "kline",
+                "success",
+                f"获取成功，最新收盘价 {summary.get('last_close', 'N/A')}",
+                duration_ms=duration_ms,
+            )
 
             return CollectorResult(
                 success=True,
@@ -249,12 +288,24 @@ class DataCollectorManager:
             duration_ms = int((datetime.now() - start_time).total_seconds() * 1000)
 
             if not data:
-                self._log("资金流向", "capital_flow", "error", "无数据", duration_ms=duration_ms)
-                return CollectorResult(success=False, error="无数据", duration_ms=duration_ms)
+                self._log(
+                    "资金流向",
+                    "capital_flow",
+                    "error",
+                    "无数据",
+                    duration_ms=duration_ms,
+                )
+                return CollectorResult(
+                    success=False, error="无数据", duration_ms=duration_ms
+                )
 
-            self._log("资金流向", "capital_flow", "success",
-                      f"获取成功，主力净流入 {data.main_net_inflow / 10000:.2f}万",
-                      duration_ms=duration_ms)
+            self._log(
+                "资金流向",
+                "capital_flow",
+                "success",
+                f"获取成功，主力净流入 {data.main_net_inflow / 10000:.2f}万",
+                duration_ms=duration_ms,
+            )
 
             return CollectorResult(
                 success=True,
@@ -264,7 +315,9 @@ class DataCollectorManager:
             )
         except Exception as e:
             duration_ms = int((datetime.now() - start_time).total_seconds() * 1000)
-            self._log("资金流向", "capital_flow", "error", str(e), duration_ms=duration_ms)
+            self._log(
+                "资金流向", "capital_flow", "error", str(e), duration_ms=duration_ms
+            )
             return CollectorResult(success=False, error=str(e), duration_ms=duration_ms)
 
     async def collect_quote(self, symbols: list[str]) -> CollectorResult:
@@ -279,9 +332,14 @@ class DataCollectorManager:
             stocks = await collector.get_stock_data(symbols)
 
             duration_ms = int((datetime.now() - start_time).total_seconds() * 1000)
-            self._log("实时行情", "quote", "success",
-                      f"获取成功，共 {len(stocks)} 只",
-                      duration_ms=duration_ms, count=len(stocks))
+            self._log(
+                "实时行情",
+                "quote",
+                "success",
+                f"获取成功，共 {len(stocks)} 只",
+                duration_ms=duration_ms,
+                count=len(stocks),
+            )
 
             return CollectorResult(
                 success=True,
@@ -296,23 +354,40 @@ class DataCollectorManager:
 
     async def test_source(self, source: DataSource) -> CollectorResult:
         """测试单个数据源"""
-        test_symbols = source.test_symbols or ["601127", "600519"]  # 默认测试赛力斯和茅台
+        test_symbols = source.test_symbols or [
+            "601127",
+            "600519",
+        ]  # 默认测试赛力斯和茅台
 
         start_time = datetime.now()
-        self._log(source.name, source.type, "start",
-                  f"开始测试，测试股票: {','.join(test_symbols)}")
+        self._log(
+            source.name,
+            source.type,
+            "start",
+            f"开始测试，测试股票: {','.join(test_symbols)}",
+        )
 
         try:
             result = await self._test_source_impl(source, test_symbols)
             duration_ms = int((datetime.now() - start_time).total_seconds() * 1000)
 
             if result.success:
-                self._log(source.name, source.type, "success",
-                          f"测试成功，获取到 {result.count} 条数据",
-                          duration_ms=duration_ms, count=result.count)
+                self._log(
+                    source.name,
+                    source.type,
+                    "success",
+                    f"测试成功，获取到 {result.count} 条数据",
+                    duration_ms=duration_ms,
+                    count=result.count,
+                )
             else:
-                self._log(source.name, source.type, "error",
-                          result.error, duration_ms=duration_ms)
+                self._log(
+                    source.name,
+                    source.type,
+                    "error",
+                    result.error,
+                    duration_ms=duration_ms,
+                )
 
             result.duration_ms = duration_ms
             result.source_name = source.name
@@ -321,7 +396,9 @@ class DataCollectorManager:
 
         except Exception as e:
             duration_ms = int((datetime.now() - start_time).total_seconds() * 1000)
-            self._log(source.name, source.type, "error", str(e), duration_ms=duration_ms)
+            self._log(
+                source.name, source.type, "error", str(e), duration_ms=duration_ms
+            )
             return CollectorResult(
                 success=False,
                 error=str(e),
@@ -330,13 +407,17 @@ class DataCollectorManager:
                 source_provider=source.provider,
             )
 
-    async def _test_source_impl(self, source: DataSource, test_symbols: list[str]) -> CollectorResult:
+    async def _test_source_impl(
+        self, source: DataSource, test_symbols: list[str]
+    ) -> CollectorResult:
         """测试数据源的具体实现"""
         from datetime import timedelta
 
         if source.type == "news":
             from src.collectors.news_collector import (
-                XueqiuNewsCollector, EastMoneyStockNewsCollector, EastMoneyNewsCollector
+                XueqiuNewsCollector,
+                EastMoneyStockNewsCollector,
+                EastMoneyNewsCollector,
             )
 
             since = datetime.now() - timedelta(hours=24)
@@ -365,7 +446,13 @@ class DataCollectorManager:
                         error_msg = "未获取到新闻数据"
                 return CollectorResult(
                     success=len(news) > 0,
-                    data=[{"title": n.title[:60], "time": n.publish_time.strftime("%m-%d %H:%M")} for n in news[:10]],
+                    data=[
+                        {
+                            "title": n.title[:60],
+                            "time": n.publish_time.strftime("%m-%d %H:%M"),
+                        }
+                        for n in news[:10]
+                    ],
                     count=len(news),
                     error=error_msg,
                 )
@@ -378,11 +465,13 @@ class DataCollectorManager:
             for symbol in test_symbols[:3]:
                 summary = collector.get_kline_summary(symbol)
                 if not summary.get("error"):
-                    results.append({
-                        "symbol": symbol,
-                        "last_close": summary.get("last_close"),
-                        "trend": summary.get("trend"),
-                    })
+                    results.append(
+                        {
+                            "symbol": symbol,
+                            "last_close": summary.get("last_close"),
+                            "trend": summary.get("trend"),
+                        }
+                    )
 
             return CollectorResult(
                 success=len(results) > 0,
@@ -399,12 +488,14 @@ class DataCollectorManager:
             for symbol in test_symbols[:3]:
                 data = collector.get_capital_flow(symbol)
                 if data:
-                    results.append({
-                        "symbol": symbol,
-                        "name": data.name,
-                        "main_net": data.main_net_inflow,
-                        "main_pct": data.main_net_inflow_pct,
-                    })
+                    results.append(
+                        {
+                            "symbol": symbol,
+                            "name": data.name,
+                            "main_net": data.main_net_inflow,
+                            "main_pct": data.main_net_inflow_pct,
+                        }
+                    )
 
             return CollectorResult(
                 success=len(results) > 0,
@@ -421,7 +512,15 @@ class DataCollectorManager:
 
             return CollectorResult(
                 success=len(stocks) > 0,
-                data=[{"symbol": s.symbol, "name": s.name, "price": s.current_price, "change_pct": s.change_pct} for s in stocks],
+                data=[
+                    {
+                        "symbol": s.symbol,
+                        "name": s.name,
+                        "price": s.current_price,
+                        "change_pct": s.change_pct,
+                    }
+                    for s in stocks
+                ],
                 count=len(stocks),
                 error="" if stocks else "获取行情失败",
             )
@@ -451,7 +550,56 @@ class DataCollectorManager:
             finally:
                 await collector.close()
 
-        return CollectorResult(success=False, error=f"不支持的数据源类型: {source.type}")
+        elif source.type == "events":
+            from src.collectors.events_collector import EastMoneyEventsCollector
+
+            from datetime import timedelta
+
+            # Use a longer window for tests to avoid "recently empty" false negatives.
+            # This is only for connectivity/format validation, not for production logic.
+            lookback_days = 365
+            since = datetime.now() - timedelta(days=lookback_days)
+            if source.provider == "eastmoney":
+                cfg = source.config or {}
+                collector = EastMoneyEventsCollector(
+                    timeout_s=cfg.get("timeout_s", 10.0),
+                    connect_timeout_s=cfg.get("connect_timeout_s"),
+                    verify_ssl=cfg.get("verify_ssl", False),
+                    proxy=cfg.get("proxy"),
+                    retries=cfg.get("retries", 1),
+                    backoff_s=cfg.get("backoff_s", 0.6),
+                )
+                items = await collector.fetch_events(
+                    symbols=test_symbols[:5],
+                    since=since,
+                    page_size=100,
+                )
+                if not items and getattr(collector, "last_error", None):
+                    return CollectorResult(
+                        success=False,
+                        data=[],
+                        count=0,
+                        error=str(collector.last_error),
+                    )
+                return CollectorResult(
+                    success=len(items) > 0,
+                    data=[
+                        {
+                            "title": i.title[:80],
+                            "time": i.publish_time.strftime("%m-%d %H:%M"),
+                            "event_type": i.event_type,
+                        }
+                        for i in items[:10]
+                    ],
+                    count=len(items),
+                    error=""
+                    if items
+                    else f"未获取到事件数据（lookback={lookback_days}d）",
+                )
+
+        return CollectorResult(
+            success=False, error=f"不支持的数据源类型: {source.type}"
+        )
 
 
 # 全局单例

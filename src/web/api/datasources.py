@@ -1,4 +1,5 @@
 """数据源管理 API"""
+
 import logging
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
@@ -18,13 +19,14 @@ TYPE_LABELS = {
     "kline": "K线数据",
     "capital_flow": "资金流向",
     "quote": "实时行情",
+    "events": "事件日历",
     "chart": "K线截图",
 }
 
 
 class DataSourceCreate(BaseModel):
     name: str
-    type: str  # news / kline / capital_flow / quote / chart
+    type: str  # news / kline / capital_flow / quote / events / chart
     provider: str
     config: dict = {}
     enabled: bool = True
@@ -89,10 +91,7 @@ def list_datasources(type: str | None = None, db: Session = Depends(get_db)):
 @router.get("/types")
 def get_datasource_types():
     """获取数据源类型列表"""
-    return [
-        {"type": k, "label": v}
-        for k, v in TYPE_LABELS.items()
-    ]
+    return [{"type": k, "label": v} for k, v in TYPE_LABELS.items()]
 
 
 @router.get("/{source_id}")
@@ -125,7 +124,9 @@ def create_datasource(data: DataSourceCreate, db: Session = Depends(get_db)):
 
 
 @router.put("/{source_id}")
-def update_datasource(source_id: int, data: DataSourceUpdate, db: Session = Depends(get_db)):
+def update_datasource(
+    source_id: int, data: DataSourceUpdate, db: Session = Depends(get_db)
+):
     """更新数据源"""
     source = db.query(DataSource).filter(DataSource.id == source_id).first()
     if not source:

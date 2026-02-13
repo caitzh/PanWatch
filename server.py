@@ -1,4 +1,5 @@
 """PanWatch 统一服务入口 - Web 后台 + Agent 调度"""
+
 import logging
 import os
 import time
@@ -7,14 +8,30 @@ from contextlib import asynccontextmanager
 import uvicorn
 
 from src.web.database import init_db, SessionLocal
-from src.web.models import AgentConfig, Stock, StockAgent, AIService, AIModel, NotifyChannel, AppSettings, DataSource
+from src.web.models import (
+    AgentConfig,
+    Stock,
+    StockAgent,
+    AIService,
+    AIModel,
+    NotifyChannel,
+    AppSettings,
+    DataSource,
+)
 from src.web.log_handler import DBLogHandler
 from src.config import Settings, AppConfig, StockConfig
 from src.models.market import MarketCode
 from src.core.ai_client import AIClient
 from src.core.notifier import NotifierManager
 from src.core.scheduler import AgentScheduler
+from src.core.price_alert_scheduler import PriceAlertScheduler
+from src.core.context_scheduler import ContextMaintenanceScheduler
 from src.core.agent_runs import record_agent_run
+from src.core.log_context import install_log_record_factory, log_context
+from src.core.agent_catalog import (
+    AGENT_SEED_SPECS,
+    AGENT_KIND_WORKFLOW,
+)
 from src.agents.base import AgentContext, PortfolioInfo, AccountInfo, PositionInfo
 from src.agents.daily_report import DailyReportAgent
 from src.agents.news_digest import NewsDigestAgent
@@ -26,6 +43,8 @@ logger = logging.getLogger(__name__)
 
 # 全局 scheduler 实例，供 agents API 调用
 scheduler: AgentScheduler | None = None
+price_alert_scheduler: PriceAlertScheduler | None = None
+context_maintenance_scheduler: ContextMaintenanceScheduler | None = None
 
 
 def setup_ssl():
@@ -40,10 +59,9 @@ def setup_ssl():
     bundle_path = os.path.join(os.path.dirname(__file__), "data", "ca-bundle.pem")
     os.makedirs(os.path.dirname(bundle_path), exist_ok=True)
 
-    need_rebuild = (
-        not os.path.exists(bundle_path)
-        or os.path.getmtime(ca_cert) > os.path.getmtime(bundle_path)
-    )
+    need_rebuild = not os.path.exists(bundle_path) or os.path.getmtime(
+        ca_cert
+    ) > os.path.getmtime(bundle_path)
 
     if need_rebuild:
         with open(bundle_path, "w") as out:
@@ -62,10 +80,25 @@ def setup_logging():
     """配置日志: 控制台 + 数据库"""
     root = logging.getLogger()
     root.setLevel(logging.INFO)
+    install_log_record_factory()
+
+    # reload/server restart 时避免重复 handler 导致日志放大。
+    for h in list(root.handlers):
+        if isinstance(h, DBLogHandler) or getattr(h, "_panwatch_console", False):
+            root.removeHandler(h)
+            try:
+                h.close()
+            except Exception:
+                pass
 
     # 控制台输出
     console = logging.StreamHandler()
-    console.setFormatter(logging.Formatter("%(asctime)s %(levelname)-5s [%(name)s] %(message)s", datefmt="%H:%M:%S"))
+    console._panwatch_console = True  # type: ignore[attr-defined]
+    console.setFormatter(
+        logging.Formatter(
+            "%(asctime)s %(levelname)-5s [%(name)s] %(message)s", datefmt="%H:%M:%S"
+        )
+    )
     root.addHandler(console)
 
     # 数据库持久化
@@ -81,6 +114,13 @@ def setup_playwright():
     通过 DOCKER 环境变量或显式设置的 PLAYWRIGHT_BROWSERS_PATH 来判断。
     """
     import subprocess
+
+    # 允许通过环境变量跳过首次安装（例如不需要截图功能时）
+    if os.environ.get("PLAYWRIGHT_SKIP_BROWSER_INSTALL") == "1":
+        logger.info(
+            "已设置 PLAYWRIGHT_SKIP_BROWSER_INSTALL=1，跳过 Playwright 浏览器安装"
+        )
+        return
 
     # 如果用户已显式设置 PLAYWRIGHT_BROWSERS_PATH，尊重该设置
     if "PLAYWRIGHT_BROWSERS_PATH" in os.environ:
@@ -114,7 +154,11 @@ def setup_playwright():
     if os.path.exists(browser_dir):
         try:
             dirs = os.listdir(browser_dir)
-            if any(d.startswith("chromium") for d in dirs if os.path.isdir(os.path.join(browser_dir, d))):
+            if any(
+                d.startswith("chromium")
+                for d in dirs
+                if os.path.isdir(os.path.join(browser_dir, d))
+            ):
                 logger.info(f"Playwright 浏览器已就绪: {browser_dir}")
                 return
         except Exception:
@@ -160,7 +204,7 @@ def seed_sample_stocks():
             {"symbol": "AAPL", "name": "苹果", "market": "US"},
         ]
         for s in samples:
-            db.add(Stock(**s, enabled=True))
+            db.add(Stock(**s))
         db.commit()
         logger.info("已添加 5 只示例股票（首次启动）")
     finally:
@@ -170,73 +214,51 @@ def seed_sample_stocks():
 def seed_agents():
     """初始化内置 Agent 配置"""
     db = SessionLocal()
-    agents = [
-        {
-            "name": "daily_report",
-            "display_name": "盘后日报",
-            "description": "每日收盘后生成自选股日报，包含大盘概览、个股分析和明日关注",
-            "enabled": True,
-            "schedule": "30 15 * * 1-5",
-            "execution_mode": "batch",  # 批量模式：多只股票一起分析
-        },
-        {
-            "name": "intraday_monitor",
-            "display_name": "盘中监测",
-            "description": "交易时段实时监控，AI 智能判断是否有值得关注的信号",
-            "enabled": False,
-            "schedule": "*/5 9-15 * * 1-5",  # 每5分钟扫描一次
-            "execution_mode": "single",  # 单只模式：逐只分析，实时发送
-            "config": {
-                "price_alert_threshold": 3.0,   # 涨跌幅超过3%触发
-                "volume_alert_ratio": 2.0,      # 量比超过2倍触发
-                "stop_loss_warning": -5.0,      # 亏损超过5%预警
-                "take_profit_warning": 10.0,    # 盈利超过10%提醒
-                "throttle_minutes": 30,         # 同一股票30分钟内不重复通知
-            },
-        },
-        {
-            "name": "news_digest",
-            "display_name": "新闻速递",
-            "description": "定时抓取与持仓相关的新闻资讯并推送摘要",
-            "enabled": False,
-            "schedule": "0 9-18/2 * * 1-5",
-            "execution_mode": "batch",
-            "config": {
-                "since_hours": 12,
-                "fallback_since_hours": 24,
-            },
-        },
-        {
-            "name": "premarket_outlook",
-            "display_name": "盘前分析",
-            "description": "开盘前综合昨日分析和隔夜信息，展望今日走势",
-            "enabled": False,
-            "schedule": "0 9 * * 1-5",
-            "execution_mode": "batch",
-        },
-        {
-            "name": "chart_analyst",
-            "display_name": "技术分析",
-            "description": "截取 K 线图并使用多模态 AI 进行技术分析",
-            "enabled": False,
-            "schedule": "0 15 * * 1-5",
-            "execution_mode": "single",
-        },
-    ]
-
-    for agent_data in agents:
-        existing = db.query(AgentConfig).filter(AgentConfig.name == agent_data["name"]).first()
+    for spec in AGENT_SEED_SPECS:
+        existing = db.query(AgentConfig).filter(AgentConfig.name == spec.name).first()
         if not existing:
-            db.add(AgentConfig(**agent_data))
+            db.add(
+                AgentConfig(
+                    name=spec.name,
+                    display_name=spec.display_name,
+                    description=spec.description,
+                    kind=spec.kind,
+                    visible=spec.visible,
+                    lifecycle_status=spec.lifecycle_status,
+                    replaced_by=spec.replaced_by,
+                    display_order=spec.display_order,
+                    enabled=spec.enabled,
+                    schedule=spec.schedule,
+                    execution_mode=spec.execution_mode,
+                    config=spec.config or {},
+                )
+            )
         else:
             # 始终同步 execution_mode（确保代码中的定义生效）
-            existing.execution_mode = agent_data.get("execution_mode", "batch")
+            existing.execution_mode = spec.execution_mode or "batch"
             # 同步 display_name 和 description
-            existing.display_name = agent_data.get("display_name", existing.display_name)
-            existing.description = agent_data.get("description", existing.description)
+            existing.display_name = spec.display_name or existing.display_name
+            existing.description = spec.description or existing.description
+            existing.kind = spec.kind
+            existing.visible = bool(spec.visible)
+            existing.lifecycle_status = spec.lifecycle_status or "active"
+            existing.replaced_by = spec.replaced_by or ""
+            existing.display_order = int(spec.display_order or 0)
+
+            # capability 强制不参与调度，避免旧配置继续触发。
+            if spec.kind != AGENT_KIND_WORKFLOW:
+                existing.enabled = False
+                existing.schedule = ""
+
             # 仅在用户未配置时补齐默认 config
-            if agent_data.get("config") and (not existing.config):
-                existing.config = agent_data.get("config")
+            if spec.config and (not existing.config):
+                existing.config = spec.config
+            # 对已存在配置做“向前兼容”的字段补齐（不覆盖用户已有值）
+            if existing.name == "intraday_monitor":
+                cfg = existing.config or {}
+                if isinstance(cfg, dict) and "event_only" not in cfg:
+                    cfg["event_only"] = True
+                    existing.config = cfg
 
     db.commit()
     db.close()
@@ -313,6 +335,17 @@ def seed_data_sources():
             "supports_batch": True,
             "test_symbols": ["601127", "600519", "300750"],
         },
+        # 事件日历数据源（基于公告结构化）
+        {
+            "name": "东方财富事件日历",
+            "type": "events",
+            "provider": "eastmoney",
+            "config": {},
+            "enabled": True,
+            "priority": 0,
+            "supports_batch": True,
+            "test_symbols": ["601127", "600519"],
+        },
         # K线截图数据源
         {
             "name": "雪球K线截图",
@@ -343,10 +376,14 @@ def seed_data_sources():
     ]
 
     for source_data in sources:
-        existing = db.query(DataSource).filter(
-            DataSource.name == source_data["name"],
-            DataSource.provider == source_data["provider"],
-        ).first()
+        existing = (
+            db.query(DataSource)
+            .filter(
+                DataSource.name == source_data["name"],
+                DataSource.provider == source_data["provider"],
+            )
+            .first()
+        )
         if existing:
             # 更新已存在记录的新字段（保留用户可能修改的配置）
             if existing.supports_batch != source_data.get("supports_batch", False):
@@ -365,23 +402,28 @@ def load_watchlist_for_agent(agent_name: str) -> list[StockConfig]:
     """从数据库加载某个 Agent 关联的自选股"""
     db = SessionLocal()
     try:
-        stock_agents = db.query(StockAgent).filter(StockAgent.agent_name == agent_name).all()
+        stock_agents = (
+            db.query(StockAgent).filter(StockAgent.agent_name == agent_name).all()
+        )
         stock_ids = [sa.stock_id for sa in stock_agents]
         if not stock_ids:
             return []
 
-        stocks = db.query(Stock).filter(Stock.id.in_(stock_ids), Stock.enabled == True).all()
+        # 绑定优先：只要绑定了 Agent，就纳入执行范围
+        stocks = db.query(Stock).filter(Stock.id.in_(stock_ids)).all()
         result = []
         for s in stocks:
             try:
                 market = MarketCode(s.market)
             except ValueError:
                 market = MarketCode.CN
-            result.append(StockConfig(
-                symbol=s.symbol,
-                name=s.name,
-                market=market,
-            ))
+            result.append(
+                StockConfig(
+                    symbol=s.symbol,
+                    name=s.name,
+                    market=market,
+                )
+            )
         return result
     finally:
         db.close()
@@ -394,7 +436,9 @@ def load_portfolio_for_agent(agent_name: str) -> PortfolioInfo:
     db = SessionLocal()
     try:
         # 获取 Agent 关联的股票 ID
-        stock_agents = db.query(StockAgent).filter(StockAgent.agent_name == agent_name).all()
+        stock_agents = (
+            db.query(StockAgent).filter(StockAgent.agent_name == agent_name).all()
+        )
         stock_ids = set(sa.stock_id for sa in stock_agents)
         if not stock_ids:
             return PortfolioInfo()
@@ -405,40 +449,48 @@ def load_portfolio_for_agent(agent_name: str) -> PortfolioInfo:
         account_infos = []
         for acc in accounts:
             # 获取该账户中属于关联股票的持仓
-            positions = db.query(Position).filter(
-                Position.account_id == acc.id,
-                Position.stock_id.in_(stock_ids),
-            ).all()
+            positions = (
+                db.query(Position)
+                .filter(
+                    Position.account_id == acc.id,
+                    Position.stock_id.in_(stock_ids),
+                )
+                .all()
+            )
 
             position_infos = []
             for pos in positions:
                 stock = pos.stock
-                if not stock or not stock.enabled:
+                if not stock:
                     continue
                 try:
                     market = MarketCode(stock.market)
                 except ValueError:
                     market = MarketCode.CN
 
-                position_infos.append(PositionInfo(
-                    account_id=acc.id,
-                    account_name=acc.name,
-                    stock_id=stock.id,
-                    symbol=stock.symbol,
-                    name=stock.name,
-                    market=market,
-                    cost_price=pos.cost_price,
-                    quantity=pos.quantity,
-                    invested_amount=pos.invested_amount,
-                    trading_style=pos.trading_style or "swing",
-                ))
+                position_infos.append(
+                    PositionInfo(
+                        account_id=acc.id,
+                        account_name=acc.name,
+                        stock_id=stock.id,
+                        symbol=stock.symbol,
+                        name=stock.name,
+                        market=market,
+                        cost_price=pos.cost_price,
+                        quantity=pos.quantity,
+                        invested_amount=pos.invested_amount,
+                        trading_style=pos.trading_style or "swing",
+                    )
+                )
 
-            account_infos.append(AccountInfo(
-                id=acc.id,
-                name=acc.name,
-                available_funds=acc.available_funds,
-                positions=position_infos,
-            ))
+            account_infos.append(
+                AccountInfo(
+                    id=acc.id,
+                    name=acc.name,
+                    available_funds=acc.available_funds,
+                    positions=position_infos,
+                )
+            )
 
         return PortfolioInfo(accounts=account_infos)
     finally:
@@ -464,32 +516,40 @@ def load_portfolio_for_stock(stock_id: int) -> PortfolioInfo:
 
         account_infos = []
         for acc in accounts:
-            pos = db.query(Position).filter(
-                Position.account_id == acc.id,
-                Position.stock_id == stock_id,
-            ).first()
+            pos = (
+                db.query(Position)
+                .filter(
+                    Position.account_id == acc.id,
+                    Position.stock_id == stock_id,
+                )
+                .first()
+            )
 
             position_infos = []
             if pos:
-                position_infos.append(PositionInfo(
-                    account_id=acc.id,
-                    account_name=acc.name,
-                    stock_id=stock.id,
-                    symbol=stock.symbol,
-                    name=stock.name,
-                    market=market,
-                    cost_price=pos.cost_price,
-                    quantity=pos.quantity,
-                    invested_amount=pos.invested_amount,
-                    trading_style=pos.trading_style or "swing",
-                ))
+                position_infos.append(
+                    PositionInfo(
+                        account_id=acc.id,
+                        account_name=acc.name,
+                        stock_id=stock.id,
+                        symbol=stock.symbol,
+                        name=stock.name,
+                        market=market,
+                        cost_price=pos.cost_price,
+                        quantity=pos.quantity,
+                        invested_amount=pos.invested_amount,
+                        trading_style=pos.trading_style or "swing",
+                    )
+                )
 
-            account_infos.append(AccountInfo(
-                id=acc.id,
-                name=acc.name,
-                available_funds=acc.available_funds,
-                positions=position_infos,
-            ))
+            account_infos.append(
+                AccountInfo(
+                    id=acc.id,
+                    name=acc.name,
+                    available_funds=acc.available_funds,
+                    positions=position_infos,
+                )
+            )
 
         return PortfolioInfo(accounts=account_infos)
     finally:
@@ -506,7 +566,19 @@ def _get_proxy() -> str:
         db.close()
 
 
-def resolve_ai_model(agent_name: str, stock_agent_id: int | None = None) -> tuple[AIModel | None, AIService | None]:
+def _get_app_setting(key: str) -> str:
+    """从 app_settings 获取配置（不存在返回空字符串）"""
+    db = SessionLocal()
+    try:
+        setting = db.query(AppSettings).filter(AppSettings.key == key).first()
+        return setting.value if setting and setting.value else ""
+    finally:
+        db.close()
+
+
+def resolve_ai_model(
+    agent_name: str, stock_agent_id: int | None = None
+) -> tuple[AIModel | None, AIService | None]:
     """解析 AI 模型: stock_agent 覆盖 → agent 默认 → 系统默认(is_default=True)
     返回 (model, service) 元组"""
     db = SessionLocal()
@@ -554,7 +626,9 @@ def resolve_ai_model(agent_name: str, stock_agent_id: int | None = None) -> tupl
         db.close()
 
 
-def resolve_notify_channels(agent_name: str, stock_agent_id: int | None = None) -> list[NotifyChannel]:
+def resolve_notify_channels(
+    agent_name: str, stock_agent_id: int | None = None
+) -> list[NotifyChannel]:
     """解析通知渠道: stock_agent 覆盖 → agent 默认 → 系统默认(is_default=True)"""
     db = SessionLocal()
     try:
@@ -574,15 +648,23 @@ def resolve_notify_channels(agent_name: str, stock_agent_id: int | None = None) 
 
         # 3. 按 id 列表查询或取系统默认
         if channel_ids:
-            channels = db.query(NotifyChannel).filter(
-                NotifyChannel.id.in_(channel_ids),
-                NotifyChannel.enabled == True,
-            ).all()
+            channels = (
+                db.query(NotifyChannel)
+                .filter(
+                    NotifyChannel.id.in_(channel_ids),
+                    NotifyChannel.enabled == True,
+                )
+                .all()
+            )
         else:
-            channels = db.query(NotifyChannel).filter(
-                NotifyChannel.is_default == True,
-                NotifyChannel.enabled == True,
-            ).all()
+            channels = (
+                db.query(NotifyChannel)
+                .filter(
+                    NotifyChannel.is_default == True,
+                    NotifyChannel.enabled == True,
+                )
+                .all()
+            )
 
         for ch in channels:
             db.expunge(ch)
@@ -593,13 +675,50 @@ def resolve_notify_channels(agent_name: str, stock_agent_id: int | None = None) 
 
 def _build_notifier(channels: list[NotifyChannel]) -> NotifierManager:
     """根据解析后的渠道列表构建 NotifierManager"""
-    notifier = NotifierManager()
+    settings = Settings()
+    # allow UI override via app_settings
+    quiet_hours = _get_app_setting("notify_quiet_hours") or settings.notify_quiet_hours
+    retry_attempts_raw = _get_app_setting("notify_retry_attempts")
+    backoff_raw = _get_app_setting("notify_retry_backoff_seconds")
+    overrides_raw = (
+        _get_app_setting("notify_dedupe_ttl_overrides")
+        or settings.notify_dedupe_ttl_overrides
+    )
+
+    try:
+        retry_attempts = (
+            int(retry_attempts_raw)
+            if retry_attempts_raw
+            else settings.notify_retry_attempts
+        )
+    except Exception:
+        retry_attempts = settings.notify_retry_attempts
+    try:
+        retry_backoff_seconds = (
+            float(backoff_raw) if backoff_raw else settings.notify_retry_backoff_seconds
+        )
+    except Exception:
+        retry_backoff_seconds = settings.notify_retry_backoff_seconds
+
+    from src.core.notify_policy import NotifyPolicy, parse_dedupe_overrides
+
+    policy = NotifyPolicy(
+        timezone=settings.app_timezone,
+        quiet_hours=quiet_hours,
+        retry_attempts=retry_attempts,
+        retry_backoff_seconds=retry_backoff_seconds,
+        dedupe_ttl_overrides=parse_dedupe_overrides(overrides_raw),
+    )
+
+    notifier = NotifierManager(policy=policy)
     for ch in channels:
         notifier.add_channel(ch.type, ch.config or {})
     return notifier
 
 
-def _build_ai_client(model: AIModel | None, service: AIService | None, proxy: str) -> AIClient:
+def _build_ai_client(
+    model: AIModel | None, service: AIService | None, proxy: str
+) -> AIClient:
     """根据解析后的 model+service 构建 AIClient"""
     if model and service:
         return AIClient(
@@ -639,6 +758,7 @@ def build_context(agent_name: str, stock_agent_id: int | None = None) -> AgentCo
         config=config,
         portfolio=portfolio,
         model_label=model_label,
+        notify_policy=getattr(notifier, "policy", None),
     )
 
 
@@ -654,14 +774,22 @@ AGENT_REGISTRY: dict[str, type] = {
 
 def build_scheduler() -> AgentScheduler:
     """构建调度器并注册已启用的 Agent"""
-    sched = AgentScheduler()
+    settings = Settings()
+    sched = AgentScheduler(timezone=settings.app_timezone)
 
     # 设置 context 构建函数（每次执行时动态获取最新配置）
     sched.set_context_builder(build_context)
 
     db = SessionLocal()
     try:
-        agent_configs = db.query(AgentConfig).filter(AgentConfig.enabled == True).all()
+        agent_configs = (
+            db.query(AgentConfig)
+            .filter(
+                AgentConfig.enabled == True,
+                AgentConfig.kind == AGENT_KIND_WORKFLOW,
+            )
+            .all()
+        )
         for cfg in agent_configs:
             agent_cls = AGENT_REGISTRY.get(cfg.name)
             if not agent_cls:
@@ -673,22 +801,57 @@ def build_scheduler() -> AgentScheduler:
 
             agent_kwargs = cfg.config or {}
             try:
-                agent_instance = agent_cls(**agent_kwargs) if agent_kwargs else agent_cls()
+                agent_instance = (
+                    agent_cls(**agent_kwargs) if agent_kwargs else agent_cls()
+                )
             except TypeError:
                 agent_instance = agent_cls()
-            sched.register(agent_instance, schedule=cfg.schedule, execution_mode=cfg.execution_mode or "batch")
+            sched.register(
+                agent_instance,
+                schedule=cfg.schedule,
+                execution_mode=cfg.execution_mode or "batch",
+            )
     finally:
         db.close()
 
     return sched
 
 
-def _log_trigger_info(agent_name: str, stocks: list, model: AIModel | None, service: AIService | None, channels: list[NotifyChannel]):
+def reload_scheduler() -> bool:
+    """重载调度器（用于配置导入/批量修改后立即生效）"""
+    global scheduler
+    try:
+        current = globals().get("scheduler")
+        if current:
+            try:
+                current.shutdown()
+            except Exception:
+                pass
+        scheduler = build_scheduler()
+        scheduler.start()
+        logger.info("Agent 调度器已重载")
+        return True
+    except Exception as e:
+        logger.error(f"Agent 调度器重载失败: {e}")
+        return False
+
+
+def _log_trigger_info(
+    agent_name: str,
+    stocks: list,
+    model: AIModel | None,
+    service: AIService | None,
+    channels: list[NotifyChannel],
+):
     """打印 Agent 触发时的上下文信息"""
-    stock_names = ", ".join(f"{s.name}({s.symbol})" if hasattr(s, 'symbol') else str(s) for s in stocks)
+    stock_names = ", ".join(
+        f"{s.name}({s.symbol})" if hasattr(s, "symbol") else str(s) for s in stocks
+    )
     ai_info = f"{service.name}/{model.model}" if model and service else "未配置"
     channel_info = ", ".join(ch.name for ch in channels) if channels else "无"
-    logger.info(f"[触发] Agent={agent_name} | 股票=[{stock_names}] | AI={ai_info} | 通知=[{channel_info}]")
+    logger.info(
+        f"[触发] Agent={agent_name} | 股票=[{stock_names}] | AI={ai_info} | 通知=[{channel_info}]"
+    )
 
 
 def get_agent_execution_mode(agent_name: str) -> str:
@@ -714,62 +877,89 @@ def get_agent_config(agent_name: str) -> dict:
 async def trigger_agent(agent_name: str) -> str:
     """手动触发 Agent 执行（根据执行模式处理）"""
     start = time.monotonic()
+    trace_id = f"man-{agent_name}-{int(time.time() * 1000)}"
     agent_cls = AGENT_REGISTRY.get(agent_name)
     if not agent_cls:
         raise ValueError(f"Agent {agent_name} 未注册实际实现")
 
-    watchlist = load_watchlist_for_agent(agent_name)
-    if not watchlist:
-        return f"Agent {agent_name} 没有关联的自选股"
-
-    model, service = resolve_ai_model(agent_name)
-    channels = resolve_notify_channels(agent_name)
-    _log_trigger_info(agent_name, watchlist, model, service, channels)
-
-    context = build_context(agent_name)
-    execution_mode = get_agent_execution_mode(agent_name)
-    agent_config = get_agent_config(agent_name)
-
-    # 根据配置初始化 Agent
-    if agent_config:
-        agent = agent_cls(**agent_config)
-    else:
-        agent = agent_cls()
-
-    try:
-        if execution_mode == "single" and hasattr(agent, "run_single"):
-            # 单只模式：逐只股票分析
-            results = []
-            for stock in watchlist:
-                result = await agent.run_single(context, stock.symbol)
-                if result:
-                    results.append(f"{stock.name}: {result.content[:100]}...")
-            msg = "\n\n".join(results) if results else "无异动"
-            record_agent_run(
-                agent_name=agent_name,
-                status="success",
-                result=msg,
-                duration_ms=int((time.monotonic() - start) * 1000),
-            )
-            return msg
-        else:
-            # 批量模式：所有股票一起分析
-            result = await agent.run(context)
-            record_agent_run(
-                agent_name=agent_name,
-                status="success",
-                result=result.content,
-                duration_ms=int((time.monotonic() - start) * 1000),
-            )
-            return result.content
-    except Exception as e:
-        record_agent_run(
-            agent_name=agent_name,
-            status="failed",
-            error=str(e),
-            duration_ms=int((time.monotonic() - start) * 1000),
+    with log_context(
+        trace_id=trace_id,
+        run_id=trace_id,
+        agent_name=agent_name,
+        event="trigger_agent",
+        tags={"trigger_source": "manual"},
+    ):
+        watchlist = load_watchlist_for_agent(agent_name)
+        logger.info(
+            f"[watchlist] Agent={agent_name} count={len(watchlist)} symbols={[s.symbol for s in watchlist]}"
         )
-        raise
+        if not watchlist:
+            return f"Agent {agent_name} 没有关联的自选股"
+
+        model, service = resolve_ai_model(agent_name)
+        channels = resolve_notify_channels(agent_name)
+        _log_trigger_info(agent_name, watchlist, model, service, channels)
+
+        context = build_context(agent_name)
+        execution_mode = get_agent_execution_mode(agent_name)
+        agent_config = get_agent_config(agent_name)
+
+        # 根据配置初始化 Agent
+        if agent_config:
+            agent = agent_cls(**agent_config)
+        else:
+            agent = agent_cls()
+
+        try:
+            if execution_mode == "single" and hasattr(agent, "run_single"):
+                # 单只模式：逐只股票分析
+                results = []
+                for stock in watchlist:
+                    result = await agent.run_single(context, stock.symbol)
+                    if result:
+                        results.append(f"{stock.name}: {result.content[:100]}...")
+                msg = "\n\n".join(results) if results else "无异动"
+                record_agent_run(
+                    agent_name=agent_name,
+                    status="success",
+                    result=msg,
+                    duration_ms=int((time.monotonic() - start) * 1000),
+                    trace_id=trace_id,
+                    trigger_source="manual",
+                    model_label=context.model_label,
+                )
+                return msg
+            else:
+                # 批量模式：所有股票一起分析
+                result = await agent.run(context)
+                raw = result.raw_data or {}
+                record_agent_run(
+                    agent_name=agent_name,
+                    status="success",
+                    result=result.content,
+                    duration_ms=int((time.monotonic() - start) * 1000),
+                    trace_id=trace_id,
+                    trigger_source="manual",
+                    notify_attempted=(
+                        "notified" in raw
+                        or "notify_error" in raw
+                        or "notify_skipped" in raw
+                    ),
+                    notify_sent=bool(raw.get("notified", False)),
+                    model_label=context.model_label,
+                )
+                return result.content
+        except Exception as e:
+            record_agent_run(
+                agent_name=agent_name,
+                status="failed",
+                error=str(e),
+                duration_ms=int((time.monotonic() - start) * 1000),
+                trace_id=trace_id,
+                trigger_source="manual",
+                model_label=context.model_label,
+            )
+            raise
 
 
 async def trigger_agent_for_stock(
@@ -777,9 +967,12 @@ async def trigger_agent_for_stock(
     stock,
     stock_agent_id: int | None = None,
     bypass_throttle: bool = False,
+    bypass_market_hours: bool = False,
+    suppress_notify: bool = False,
 ) -> dict:
     """手动触发 Agent 执行（单只股票）"""
     start = time.monotonic()
+    trace_id = f"man-{agent_name}-{stock.symbol}-{int(time.time() * 1000)}"
     agent_cls = AGENT_REGISTRY.get(agent_name)
     if not agent_cls:
         raise ValueError(f"Agent {agent_name} 未注册实际实现")
@@ -802,7 +995,7 @@ async def trigger_agent_for_stock(
     portfolio = load_portfolio_for_stock(stock.id)
 
     model, service = resolve_ai_model(agent_name, stock_agent_id)
-    channels = resolve_notify_channels(agent_name, stock_agent_id)
+    channels = [] if suppress_notify else resolve_notify_channels(agent_name, stock_agent_id)
     _log_trigger_info(agent_name, [stock], model, service, channels)
 
     ai_client = _build_ai_client(model, service, proxy)
@@ -816,37 +1009,69 @@ async def trigger_agent_for_stock(
         config=config,
         portfolio=portfolio,
         model_label=model_label,
+        suppress_notify=suppress_notify,
     )
 
-    # 创建 agent，支持 bypass_throttle 参数
-    if agent_name == "intraday_monitor" and bypass_throttle:
-        agent = agent_cls(bypass_throttle=True)
+    # 创建 agent，支持 intraday_monitor 的手动触发参数
+    if agent_name == "intraday_monitor":
+        agent = agent_cls(
+            bypass_throttle=bypass_throttle,
+            bypass_market_hours=bypass_market_hours,
+        )
     else:
         agent = agent_cls()
 
-    try:
-        result = await agent.run(context)
-        record_agent_run(
-            agent_name=agent_name,
-            status="success",
-            result=result.content,
-            duration_ms=int((time.monotonic() - start) * 1000),
-        )
-    except Exception as e:
-        record_agent_run(
-            agent_name=agent_name,
-            status="failed",
-            error=str(e),
-            duration_ms=int((time.monotonic() - start) * 1000),
-        )
-        raise
+    with log_context(
+        trace_id=trace_id,
+        run_id=trace_id,
+        agent_name=agent_name,
+        event="trigger_agent_for_stock",
+        tags={"trigger_source": "manual", "stock_symbol": stock.symbol},
+    ):
+        try:
+            result = await agent.run(context)
+            raw = result.raw_data or {}
+            record_agent_run(
+                agent_name=agent_name,
+                status="success",
+                result=result.content,
+                duration_ms=int((time.monotonic() - start) * 1000),
+                trace_id=trace_id,
+                trigger_source="manual",
+                notify_attempted=(
+                    "notified" in raw
+                    or "notify_error" in raw
+                    or "notify_skipped" in raw
+                ),
+                notify_sent=bool(raw.get("notified", False)),
+                model_label=model_label,
+            )
+        except Exception as e:
+            record_agent_run(
+                agent_name=agent_name,
+                status="failed",
+                error=str(e),
+                duration_ms=int((time.monotonic() - start) * 1000),
+                trace_id=trace_id,
+                trigger_source="manual",
+                model_label=model_label,
+            )
+            raise
 
     # 返回详细结果
+    skipped = bool(result.raw_data.get("skipped", False))
+    should_alert = bool(
+        result.raw_data.get("should_alert", False if skipped else True)
+    )
     return {
+        "code": 0 if not skipped else 1001001,
+        "success": not skipped,
+        "message": result.content if skipped else "ok",
         "title": result.title,
         "content": result.content,
-        "should_alert": result.raw_data.get("should_alert", True),
+        "should_alert": should_alert,
         "notified": result.raw_data.get("notified", False),
+        "skipped": skipped,
     }
 
 
@@ -860,6 +1085,7 @@ async def lifespan(app):
 
     # 从环境变量初始化认证（Docker 部署用）
     from src.web.api.auth import init_auth_from_env
+
     db = SessionLocal()
     try:
         if init_auth_from_env(db):
@@ -874,24 +1100,56 @@ async def lifespan(app):
     # 后台刷新股票列表缓存
     import threading
     from src.web.stock_list import get_stock_list, refresh_stock_list
+
     def refresh_stock_cache():
         stocks = get_stock_list()
-        if not stocks or len([s for s in stocks if s['market'] == 'CN']) == 0:
+        if not stocks or len([s for s in stocks if s["market"] == "CN"]) == 0:
             logger.info("股票列表缓存为空或缺少 A 股，后台刷新中...")
             refresh_stock_list()
+
     threading.Thread(target=refresh_stock_cache, daemon=True).start()
 
-    global scheduler
+    global scheduler, price_alert_scheduler, context_maintenance_scheduler
     scheduler = build_scheduler()
     scheduler.start()
     logger.info("Agent 调度器已启动")
+    try:
+        settings = Settings()
+        price_alert_scheduler = PriceAlertScheduler(
+            timezone=settings.app_timezone,
+            interval_seconds=60,
+        )
+        price_alert_scheduler.start()
+        logger.info("价格提醒调度器已启动")
+    except Exception as e:
+        logger.error(f"价格提醒调度器启动失败: {e}")
+    try:
+        settings = Settings()
+        context_maintenance_scheduler = ContextMaintenanceScheduler(
+            timezone=settings.app_timezone,
+            eval_interval_hours=6,
+            snapshot_retention_days=180,
+            outcome_retention_days=365,
+        )
+        context_maintenance_scheduler.start()
+        logger.info("上下文维护调度器已启动")
+    except Exception as e:
+        logger.error(f"上下文维护调度器启动失败: {e}")
     yield
-    scheduler.shutdown()
-    logger.info("Agent 调度器已关闭")
+    if scheduler:
+        scheduler.shutdown()
+        logger.info("Agent 调度器已关闭")
+    if price_alert_scheduler:
+        price_alert_scheduler.shutdown()
+        logger.info("价格提醒调度器已关闭")
+    if context_maintenance_scheduler:
+        context_maintenance_scheduler.shutdown()
+        logger.info("上下文维护调度器已关闭")
 
 
 # 模块级 app 实例，供 uvicorn reload 使用
 from src.web.app import app  # noqa: E402
+
 app.router.lifespan_context = lifespan
 
 # 生产环境静态文件服务

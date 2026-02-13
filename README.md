@@ -65,6 +65,16 @@ Telegram / 企业微信 / 钉钉 / 飞书 / Bark / 自定义 Webhook
 
 </details>
 
+<details>
+<summary><b>价格提醒</b></summary>
+
+- 支持价格、涨跌幅、成交额、量比等条件组合（AND / OR）
+- 支持交易时段/全天生效、冷却时间、日触发上限、重复触发模式
+- 到期时间使用弹窗内日期面板 + `HH:mm` 输入，留空表示永不过期
+- 可按规则选择通知渠道，不选则走系统默认渠道
+
+</details>
+
 ## 快速开始
 
 ```bash
@@ -76,6 +86,10 @@ docker run -d \
 ```
 
 访问 `http://localhost:8000`，首次使用设置账号密码即可。
+
+说明：镜像内已包含 Playwright 运行所需的系统依赖；Chromium 浏览器会在容器首次启动时自动下载并安装到挂载卷（默认 `/app/data/playwright`），首次启动可能需要几分钟且需要网络可达。
+
+如果不需要截图等浏览器能力，可以在启动容器时设置 `PLAYWRIGHT_SKIP_BROWSER_INSTALL=1` 跳过首次 Chromium 下载/安装。
 
 <details>
 <summary>Docker Compose</summary>
@@ -111,6 +125,8 @@ docker-compose up -d
 | `AUTH_PASSWORD` | 预设登录密码 | 首次访问时设置 |
 | `JWT_SECRET` | JWT 签名密钥 | 自动生成 |
 | `DATA_DIR` | 数据存储目录 | `./data` |
+| `TZ` | 应用时区（影响 Agent 调度触发时间与时间展示） | `Asia/Shanghai` |
+| `PLAYWRIGHT_SKIP_BROWSER_INSTALL` | 跳过首次 Chromium 安装（不需要截图时可用） | 未设置 |
 
 </details>
 
@@ -143,11 +159,39 @@ cd frontend && pnpm install && pnpm dev
 
 </details>
 
-## 技术栈
+<details>
+<summary><b>技术栈</b></summary>
 
 **后端**：FastAPI / SQLAlchemy / APScheduler / OpenAI SDK
 
 **前端**：React 18 / TypeScript / Tailwind CSS / shadcn/ui
+
+</details>
+
+<details>
+<summary><b>发布（Docker 镜像）</b></summary>
+
+本项目内置 GitHub Actions 发布流程：
+
+- 打 tag（例如 `0.2.3`）会自动构建并推送 Docker 镜像
+  - `sunxiao0721/panwatch:0.2.3`
+  - `sunxiao0721/panwatch:latest`
+- 也支持在 GitHub Actions 里手动触发（workflow_dispatch）指定版本号
+
+需要在仓库 Secrets 中配置：
+
+- `DOCKERHUB_USERNAME`
+- `DOCKERHUB_TOKEN`
+
+</details>
+
+## 捐赠支持
+
+如果你觉得 PanWatch 有帮助，欢迎请作者喝杯咖啡：
+
+| 微信赞赏 | 支付宝 |
+|:---:|:---:|
+| <img src="./docs/donate/wechat.png" width="240" /> | <img src="./docs/donate/alipay.png" width="240" /> |
 
 ## 贡献
 

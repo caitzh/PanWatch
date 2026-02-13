@@ -1,25 +1,30 @@
 import { useState, useEffect, useRef, useCallback, useMemo } from 'react'
-import { useNavigate } from 'react-router-dom'
 import { Plus, Trash2, Pencil, Search, X, TrendingUp, Bot, Play, RefreshCw, Wallet, PiggyBank, ArrowUpRight, ArrowDownRight, Building2, ChevronDown, ChevronRight, Cpu, Bell, Clock, Newspaper, ExternalLink, BarChart3 } from 'lucide-react'
-import { fetchAPI, useLocalStorage, type AIService, type NotifyChannel } from '@/lib/utils'
-import { SuggestionBadge, type SuggestionInfo, type KlineSummary } from '@/components/suggestion-badge'
+import { fetchAPI, stocksApi, type AIService, type NotifyChannel } from '@panwatch/api'
+import { useLocalStorage } from '@/lib/utils'
+import { SuggestionBadge, type SuggestionInfo, type KlineSummary } from '@panwatch/biz-ui/components/suggestion-badge'
 import { buildKlineSuggestion } from '@/lib/kline-scorer'
-import { KlineSummaryDialog } from '@/components/kline-summary-dialog'
-import { Button } from '@/components/ui/button'
-import { Input } from '@/components/ui/input'
-import { Label } from '@/components/ui/label'
-import { Switch } from '@/components/ui/switch'
-import { Badge } from '@/components/ui/badge'
-import { Skeleton } from '@/components/ui/skeleton'
-import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription } from '@/components/ui/dialog'
-import { Select, SelectTrigger, SelectValue, SelectContent, SelectGroup, SelectLabel, SelectItem } from '@/components/ui/select'
-import { useToast } from '@/components/ui/toast'
+import { KlineSummaryDialog } from '@panwatch/biz-ui/components/kline-summary-dialog'
+import { Button } from '@panwatch/base-ui/components/ui/button'
+import { Input } from '@panwatch/base-ui/components/ui/input'
+import { Label } from '@panwatch/base-ui/components/ui/label'
+import { Switch } from '@panwatch/base-ui/components/ui/switch'
+import { Badge } from '@panwatch/base-ui/components/ui/badge'
+import { Skeleton } from '@panwatch/base-ui/components/ui/skeleton'
+import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription } from '@panwatch/base-ui/components/ui/dialog'
+import { Select, SelectTrigger, SelectValue, SelectContent, SelectGroup, SelectLabel, SelectItem } from '@panwatch/base-ui/components/ui/select'
+import { useToast } from '@panwatch/base-ui/components/ui/toast'
+import StockInsightModal from '@panwatch/biz-ui/components/stock-insight-modal'
+import StockPriceAlertPanel from '@panwatch/biz-ui/components/stock-price-alert-panel'
 
 interface AgentResult {
+  success?: boolean
+  message?: string
   title: string
   content: string
   should_alert: boolean
   notified: boolean
+  skipped?: boolean
 }
 
 interface StockAgentInfo {
@@ -34,7 +39,7 @@ interface Stock {
   symbol: string
   name: string
   market: string
-  enabled: boolean
+  sort_order?: number
   agents: StockAgentInfo[]
 }
 
@@ -48,6 +53,7 @@ interface Account {
 interface Position {
   id: number
   stock_id: number
+  sort_order?: number
   symbol: string
   name: string
   market: string
@@ -101,6 +107,12 @@ interface AgentConfig {
   enabled: boolean
   schedule: string
   execution_mode: string  // batch: 批量分析, single: 逐只分析
+}
+
+interface SchedulePreview {
+  schedule: string
+  timezone: string
+  next_runs: string[]
 }
 
 interface SearchResult {
@@ -168,6 +180,8 @@ interface PoolSuggestion {
   is_expired: boolean
   prompt_context: string
   ai_response: string
+  meta?: Record<string, any>
+  should_alert?: boolean
 }
 
 interface MarketStatus {
@@ -190,6 +204,12 @@ interface NewsItem {
   symbols: string[]
   importance: number
   url: string
+}
+
+interface PriceAlertRuleSummary {
+  stock_symbol: string
+  market: string
+  enabled: boolean
 }
 
 const emptyStockForm: StockForm = { symbol: '', name: '', market: 'CN' }
@@ -314,15 +334,16 @@ export default function StocksPage() {
 
   // Alerts / Scanning
   const [scanning, setScanning] = useState(false)
-  const [enableAIAnalysis, setEnableAIAnalysis] = useState(true)  // 是否启用 AI 分析建议
+
+  type ViewTab = 'positions' | 'watchlist'
+  const [viewTab, setViewTab] = useLocalStorage<ViewTab>('panwatch_stocks_viewTab', 'positions')
 
   // 股票 AI 建议（来自盘中监控 API）
   const [suggestions] = useState<Record<string, StockSuggestionData>>({})
-  const [suggestionsLoading] = useState(false)
-
   // 建议池建议（来自 /suggestions API）
   const [poolSuggestions, setPoolSuggestions] = useState<Record<string, PoolSuggestion>>({})
   const [poolSuggestionsLoading, setPoolSuggestionsLoading] = useState(false)
+  const [priceAlertSummaryMap, setPriceAlertSummaryMap] = useState<Record<string, { total: number; enabled: number }>>({})
 
   // News Dialog
   const [newsDialogOpen, setNewsDialogOpen] = useState(false)
@@ -337,6 +358,11 @@ export default function StocksPage() {
   const [klineDialogName, setKlineDialogName] = useState<string | undefined>(undefined)
   const [klineDialogHasPosition, setKlineDialogHasPosition] = useState<boolean>(false)
   const [klineDialogInitialSummary, setKlineDialogInitialSummary] = useState<KlineSummary | null>(null)
+  const [insightOpen, setInsightOpen] = useState(false)
+  const [insightSymbol, setInsightSymbol] = useState('')
+  const [insightMarket, setInsightMarket] = useState('CN')
+  const [insightName, setInsightName] = useState<string | undefined>(undefined)
+  const [insightHasPosition, setInsightHasPosition] = useState(false)
 
   // Market status
   const [marketStatus, setMarketStatus] = useState<MarketStatus[]>([])
@@ -374,16 +400,106 @@ export default function StocksPage() {
   // Agent dialog
   const [agentDialogStock, setAgentDialogStock] = useState<Stock | null>(null)
   const [triggeringAgent, setTriggeringAgent] = useState<string | null>(null)
+  const [schedulePreviewCache, setSchedulePreviewCache] = useState<Record<string, SchedulePreview | { error: string }>>({})
+  const [schedulePreviewLoading, setSchedulePreviewLoading] = useState<Record<string, boolean>>({})
   // 运行中的单只股票 Agent（按股票标记具体 Agent 名称）
   const [runningAgents, setRunningAgents] = useState<Record<number, string | null>>({})
   const [agentResultDialog, setAgentResultDialog] = useState<{ title: string; content: string; should_alert: boolean; notified: boolean } | null>(null)
 
   // Stock list filter
   const [stockListFilter, setStockListFilter] = useState('')  // '' = 全部, 'CN' = A股, 'HK' = 港股, 'US' = 美股
-  const [showOnlyWithoutPosition, setShowOnlyWithoutPosition] = useLocalStorage('stocks-show-only-without-position', true)  // 只显示未持仓
+  const [watchlistOnlyAlerts, setWatchlistOnlyAlerts] = useLocalStorage<boolean>('panwatch_watchlist_only_alerts', false)
+
+  // Remove watchlist modal
+  const [removeWatchStock, setRemoveWatchStock] = useState<Stock | null>(null)
+  const [removingWatchStock, setRemovingWatchStock] = useState(false)
+  const [draggingWatchStockId, setDraggingWatchStockId] = useState<number | null>(null)
+  const [draggingPositionId, setDraggingPositionId] = useState<number | null>(null)
+  const [draggingPositionAccountId, setDraggingPositionAccountId] = useState<number | null>(null)
+  const watchDragSnapshotRef = useRef<Stock[] | null>(null)
+  const positionDragSnapshotRef = useRef<PortfolioSummary | null>(null)
 
   const { toast } = useToast()
-  const navigate = useNavigate()
+
+  const moveById = <T extends { id: number }>(list: T[], fromId: number, toId: number): T[] => {
+    const fromIdx = list.findIndex(x => x.id === fromId)
+    const toIdx = list.findIndex(x => x.id === toId)
+    if (fromIdx < 0 || toIdx < 0 || fromIdx === toIdx) return list
+    const next = [...list]
+    const [moved] = next.splice(fromIdx, 1)
+    next.splice(toIdx, 0, moved)
+    return next
+  }
+
+  const persistWatchlistOrder = useCallback(async (ordered: Stock[]) => {
+    const payload = ordered.map((s, idx) => ({ id: s.id, sort_order: idx + 1 }))
+    await fetchAPI('/stocks/reorder', {
+      method: 'PUT',
+      body: JSON.stringify({ items: payload }),
+    })
+  }, [])
+
+  const previewWatchlistReorder = useCallback((fromId: number, toId: number) => {
+    if (fromId === toId) return
+    setStocks(prev => {
+      const ordered = [...prev].sort((a, b) => Number(a.sort_order || 0) - Number(b.sort_order || 0) || a.id - b.id)
+      const moved = moveById(ordered, fromId, toId)
+      return moved.map((s, idx) => ({ ...s, sort_order: idx + 1 }))
+    })
+  }, [])
+
+  const commitWatchlistReorder = useCallback(async () => {
+    const current = stocks
+    if (!current || current.length === 0) return
+    try {
+      await persistWatchlistOrder(current)
+    } catch (e) {
+      if (watchDragSnapshotRef.current) setStocks(watchDragSnapshotRef.current)
+      toast(e instanceof Error ? e.message : '保存关注排序失败', 'error')
+    }
+  }, [persistWatchlistOrder, stocks, toast])
+
+  const persistPositionOrder = useCallback(async (ordered: Position[]) => {
+    const payload = ordered.map((p, idx) => ({ id: p.id, sort_order: idx + 1 }))
+    await fetchAPI('/positions/reorder/batch', {
+      method: 'PUT',
+      body: JSON.stringify({ items: payload }),
+    })
+  }, [])
+
+  const previewPositionReorder = useCallback((accountId: number, fromId: number, toId: number) => {
+    if (fromId === toId) return
+    setPortfolioRaw(prev => {
+      if (!prev) return prev
+      const accountsNext = prev.accounts.map(acc => {
+        if (acc.id !== accountId) return acc
+        const moved = moveById(acc.positions || [], fromId, toId).map((p, idx) => ({ ...p, sort_order: idx + 1 }))
+        return { ...acc, positions: moved }
+      })
+      return { ...prev, accounts: accountsNext }
+    })
+  }, [])
+
+  const commitPositionReorder = useCallback(async (accountId: number) => {
+    const acc = portfolioRaw?.accounts?.find(a => a.id === accountId)
+    const ordered = acc?.positions || []
+    if (!ordered.length) return
+    try {
+      await persistPositionOrder(ordered)
+    } catch (e) {
+      if (positionDragSnapshotRef.current) setPortfolioRaw(positionDragSnapshotRef.current)
+      toast(e instanceof Error ? e.message : '保存持仓排序失败', 'error')
+    }
+  }, [persistPositionOrder, portfolioRaw, toast])
+
+  const isSuppressCardClick = () => {
+    try {
+      const until = (window as any).__panwatch_suppress_card_click_until
+      return typeof until === 'number' && Date.now() < until
+    } catch {
+      return false
+    }
+  }
   const searchTimer = useRef<ReturnType<typeof setTimeout>>()
   const dropdownRef = useRef<HTMLDivElement>(null)
 
@@ -459,7 +575,6 @@ export default function StocksPage() {
     const seen = new Set<string>()
 
     for (const stock of stocks) {
-      if (!stock.enabled) continue
       const key = `${stock.market}:${stock.symbol}`
       if (seen.has(key)) continue
       seen.add(key)
@@ -542,7 +657,8 @@ export default function StocksPage() {
         }
       }
       await Promise.all(Array.from({ length: Math.min(limit, items.length) }, () => worker()))
-      setKlineSummaries(map)
+      // 增量合并：本轮单只失败时保留旧值，避免技术徽章闪断/消失
+      setKlineSummaries(prev => ({ ...prev, ...map }))
     })()
     klineRefreshInFlight.current = run
     try { await run } finally { klineRefreshInFlight.current = null }
@@ -552,12 +668,28 @@ export default function StocksPage() {
   const loadPoolSuggestions = useCallback(async () => {
     setPoolSuggestionsLoading(true)
     try {
-      const data = await fetchAPI<Record<string, PoolSuggestion>>('/suggestions')
+      const data = await fetchAPI<Record<string, PoolSuggestion>>('/suggestions?include_expired=true')
       setPoolSuggestions(data)
     } catch (e) {
       console.warn('加载建议池失败:', e)
     } finally {
       setPoolSuggestionsLoading(false)
+    }
+  }, [])
+
+  const loadPriceAlertSummaries = useCallback(async () => {
+    try {
+      const rows = await fetchAPI<PriceAlertRuleSummary[]>('/price-alerts')
+      const map: Record<string, { total: number; enabled: number }> = {}
+      for (const r of rows || []) {
+        const key = `${String(r.market || 'CN').toUpperCase()}:${String(r.stock_symbol || '').toUpperCase()}`
+        if (!map[key]) map[key] = { total: 0, enabled: 0 }
+        map[key].total += 1
+        if (r.enabled) map[key].enabled += 1
+      }
+      setPriceAlertSummaryMap(map)
+    } catch (e) {
+      console.warn('加载提醒摘要失败:', e)
     }
   }, [])
 
@@ -596,9 +728,36 @@ export default function StocksPage() {
     loadNews(stockName)
   }, [loadNews])
 
-  const openStockDetail = useCallback((stockSymbol: string, stockMarket: string) => {
-    navigate(`/stock/${encodeURIComponent(stockMarket)}/${encodeURIComponent(stockSymbol)}`)
-  }, [navigate])
+  const openStockDetail = useCallback((stockSymbol: string, stockMarket: string, stockName?: string, hasPosition?: boolean) => {
+    setInsightSymbol(stockSymbol)
+    setInsightMarket(stockMarket || 'CN')
+    setInsightName(stockName)
+    setInsightHasPosition(!!hasPosition)
+    setInsightOpen(true)
+  }, [])
+
+  const formatPreviewTime = (iso: string, tz?: string): string => {
+    try {
+      const d = new Date(iso)
+      if (isNaN(d.getTime())) return iso
+      return d.toLocaleString('zh-CN', {
+        timeZone: tz || undefined,
+        month: '2-digit',
+        day: '2-digit',
+        hour: '2-digit',
+        minute: '2-digit',
+        hour12: false,
+      })
+    } catch {
+      return iso
+    }
+  }
+
+  const effectiveSchedule = (agent: AgentConfig, stockAgent?: StockAgentInfo | null): string => {
+    const local = (stockAgent?.schedule || '').trim()
+    if (local) return local
+    return (agent.schedule || '').trim()
+  }
 
   // Refresh quotes only (decoupled from portfolio and scans)
   const handleRefresh = useCallback(async () => {
@@ -609,23 +768,104 @@ export default function StocksPage() {
     ])
   }, [refreshQuotes, loadPoolSuggestions, refreshKlines])
 
-  useEffect(() => { load(); loadPortfolio(); loadPoolSuggestions(); refreshKlines() }, [])
+  useEffect(() => { load(); loadPortfolio(); loadPoolSuggestions(); loadPriceAlertSummaries(); refreshKlines() }, [])
+
+  // 仅关注列表场景（无持仓）也要在列表加载后预取 K 线摘要，保证技术指标徽章可见
+  const watchlistKlineInitDone = useRef(false)
+  const klineMissingRetryRef = useRef<Record<string, number>>({})
+  useEffect(() => {
+    if (watchlistKlineInitDone.current) return
+    if (!stocks || stocks.length === 0) return
+    watchlistKlineInitDone.current = true
+    refreshKlines()
+  }, [stocks, refreshKlines])
+
+  // 关注列表变更后，自动补齐缺失的 K 线摘要（避免未配置 agent 时没有技术指标徽章）
+  useEffect(() => {
+    if (!stocks || stocks.length === 0) return
+    const now = Date.now()
+    const retryGapMs = 2 * 60 * 1000
+    const missing = stocks.filter(s => {
+      const key = `${s.market || 'CN'}:${s.symbol}`
+      if (klineSummaries[key]) return false
+      const lastTry = klineMissingRetryRef.current[key] || 0
+      return (now - lastTry) > retryGapMs
+    })
+    if (missing.length === 0) return
+    for (const s of missing) {
+      const key = `${s.market || 'CN'}:${s.symbol}`
+      klineMissingRetryRef.current[key] = now
+    }
+    refreshKlines()
+  }, [stocks, klineSummaries, refreshKlines])
+
+  // Agent 配置弹窗：预览未来触发时间（用于自检工作日/周末语义）
+  useEffect(() => {
+    if (!agentDialogStock) return
+    if (!agents || agents.length === 0) return
+
+    const stockAgentMap = new Map((agentDialogStock.agents || []).map(a => [a.agent_name, a]))
+    const schedules = new Set<string>()
+    for (const agent of agents) {
+      if (agent.execution_mode === 'batch') continue
+      const sa = stockAgentMap.get(agent.name)
+      if (!sa) continue
+      const eff = effectiveSchedule(agent, sa)
+      if (eff) schedules.add(eff)
+    }
+
+    const toFetch = Array.from(schedules).filter(s => !schedulePreviewCache[s] && !schedulePreviewLoading[s])
+    if (toFetch.length === 0) return
+
+    let cancelled = false
+    ;(async () => {
+      // Mark loading
+      setSchedulePreviewLoading(prev => {
+        const next = { ...prev }
+        for (const s of toFetch) next[s] = true
+        return next
+      })
+      try {
+        const pairs = await Promise.all(toFetch.map(async s => {
+          try {
+            const p = await fetchAPI<SchedulePreview>(`/agents/schedule/preview?schedule=${encodeURIComponent(s)}&count=5`)
+            return [s, p] as const
+          } catch (e) {
+            const msg = e instanceof Error ? e.message : '预览失败'
+            return [s, { error: msg }] as const
+          }
+        }))
+        if (cancelled) return
+        setSchedulePreviewCache(prev => ({ ...prev, ...Object.fromEntries(pairs) }))
+      } finally {
+        if (cancelled) return
+        setSchedulePreviewLoading(prev => {
+          const next = { ...prev }
+          for (const s of toFetch) next[s] = false
+          return next
+        })
+      }
+    })()
+
+    return () => { cancelled = true }
+  }, [agentDialogStock, agents, schedulePreviewCache, schedulePreviewLoading])
 
   // 触发扫描：调用盘中监控扫描，并刷新建议池
   const scanAndReload = useCallback(async () => {
     setScanning(true)
     try {
-      const url = enableAIAnalysis ? '/agents/intraday/scan?analyze=true' : '/agents/intraday/scan'
+      const url = '/agents/intraday/scan?analyze=true'
       await fetchAPI(url, { method: 'POST' })
       await loadPoolSuggestions()
       await refreshKlines()
       setLastRefreshTime(new Date())
     } catch (e) {
       console.error('扫描失败:', e)
+      toast(e instanceof Error ? e.message : '扫描失败', 'error')
     } finally {
       setScanning(false)
     }
-  }, [enableAIAnalysis, loadPoolSuggestions, refreshKlines])
+  }, [loadPoolSuggestions, refreshKlines, toast])
 
   // 首次加载后，按需刷新 K 线摘要与建议池
   const initialKlineDone = useRef(false)
@@ -642,9 +882,11 @@ export default function StocksPage() {
     if (autoRefresh) {
       refreshQuotes()
       refreshKlines()
+      loadPoolSuggestions()
       refreshTimerRef.current = setInterval(() => {
         refreshQuotes()
         refreshKlines()
+        loadPoolSuggestions()
       }, refreshInterval * 1000)
     } else {
       // Clear interval when disabled
@@ -723,19 +965,41 @@ export default function StocksPage() {
 
   const handleStockSubmit = async (e: React.FormEvent) => {
     e.preventDefault()
-    await fetchAPI('/stocks', { method: 'POST', body: JSON.stringify(stockForm) })
-    setStockForm(emptyStockForm)
-    setSearchQuery('')
-    setShowStockForm(false)
-    load()
-    toast('股票已添加', 'success')
+    try {
+      await stocksApi.create(stockForm)
+      setStockForm(emptyStockForm)
+      setSearchQuery('')
+      setShowStockForm(false)
+      load()
+      toast('股票已添加', 'success')
+    } catch (e) {
+      toast(e instanceof Error ? e.message : '添加股票失败', 'error')
+    }
   }
 
-  const handleDeleteStock = async (id: number) => {
-    if (!confirm('确定删除？这将同时删除该股票的所有持仓记录')) return
-    await fetchAPI(`/stocks/${id}`, { method: 'DELETE' })
-    load()
-    loadPortfolio()
+  const hasAnyPositionForStockId = (id: number): boolean => {
+    return (portfolio?.accounts || []).some(acc => (acc.positions || []).some(p => p.stock_id === id))
+  }
+
+  const removeFromWatchlist = async (stock: Stock) => {
+    if (hasAnyPositionForStockId(stock.id)) {
+      toast('该股票存在持仓，请先删除持仓后再删除股票', 'error')
+      return
+    }
+
+    setRemovingWatchStock(true)
+    try {
+      await stocksApi.remove(stock.id)
+      toast('股票已删除', 'success')
+      setRemoveWatchStock(null)
+      load()
+      // 价格提醒/关联配置会随股票删除，刷新一次避免 UI 残留。
+      loadPortfolio()
+    } catch (e) {
+      toast(e instanceof Error ? e.message : '删除失败', 'error')
+    } finally {
+      setRemovingWatchStock(false)
+    }
   }
 
   // ========== Account handlers ==========
@@ -751,27 +1015,35 @@ export default function StocksPage() {
   }
 
   const handleAccountSubmit = async () => {
-    const payload = {
-      name: accountForm.name,
-      available_funds: parseFloat(accountForm.available_funds) || 0,
+    try {
+      const payload = {
+        name: accountForm.name,
+        available_funds: parseFloat(accountForm.available_funds) || 0,
+      }
+      if (editAccountId) {
+        await fetchAPI(`/accounts/${editAccountId}`, { method: 'PUT', body: JSON.stringify(payload) })
+      } else {
+        await fetchAPI('/accounts', { method: 'POST', body: JSON.stringify(payload) })
+      }
+      setAccountDialogOpen(false)
+      load()
+      loadPortfolio()
+      toast(editAccountId ? '账户已更新' : '账户已创建', 'success')
+    } catch (e) {
+      toast(e instanceof Error ? e.message : '保存账户失败', 'error')
     }
-    if (editAccountId) {
-      await fetchAPI(`/accounts/${editAccountId}`, { method: 'PUT', body: JSON.stringify(payload) })
-    } else {
-      await fetchAPI('/accounts', { method: 'POST', body: JSON.stringify(payload) })
-    }
-    setAccountDialogOpen(false)
-    load()
-    loadPortfolio()
-    toast(editAccountId ? '账户已更新' : '账户已创建', 'success')
   }
 
   const handleDeleteAccount = async (id: number) => {
     if (!confirm('确定删除该账户？这将同时删除该账户的所有持仓记录')) return
-    await fetchAPI(`/accounts/${id}`, { method: 'DELETE' })
-    load()
-    loadPortfolio()
-    toast('账户已删除', 'success')
+    try {
+      await fetchAPI(`/accounts/${id}`, { method: 'DELETE' })
+      load()
+      loadPortfolio()
+      toast('账户已删除', 'success')
+    } catch (e) {
+      toast(e instanceof Error ? e.message : '删除账户失败', 'error')
+    }
   }
 
   // ========== Position handlers ==========
@@ -850,69 +1122,86 @@ export default function StocksPage() {
   }
 
   const handlePositionSubmit = async () => {
-    let stockId = positionForm.stock_id
+    try {
+      let stockId = positionForm.stock_id
 
-    // 如果是新增且股票不在自选中，先添加到自选
-    if (!editPositionId && !stockId && positionForm.stock_symbol) {
-      try {
-        const newStock = await fetchAPI<Stock>('/stocks', {
-          method: 'POST',
-          body: JSON.stringify({
-            symbol: positionForm.stock_symbol,
-            name: positionForm.stock_name,
-            market: positionForm.stock_market,
+      // 如果是新增且股票不在自选中，先添加到自选
+      if (!editPositionId && !stockId && positionForm.stock_symbol) {
+        try {
+          const newStock = await fetchAPI<Stock>('/stocks', {
+            method: 'POST',
+            body: JSON.stringify({
+              symbol: positionForm.stock_symbol,
+              name: positionForm.stock_name,
+              market: positionForm.stock_market,
+            })
           })
-        })
-        stockId = newStock.id
-        load() // 刷新股票列表
-      } catch (e) {
-        // 股票可能已存在，尝试获取
-        const existingStocks = await fetchAPI<Stock[]>('/stocks')
-        const existing = existingStocks.find(s => s.symbol === positionForm.stock_symbol && s.market === positionForm.stock_market)
-        if (existing) {
-          stockId = existing.id
-        } else {
-          toast('添加股票失败', 'error')
-          return
+          stockId = newStock.id
+          load() // 刷新股票列表
+        } catch {
+          // 股票可能已存在，尝试获取（兼容并发创建/历史数据）。
+          try {
+            const existingStocks = await fetchAPI<Stock[]>('/stocks')
+            const existing = existingStocks.find(s => s.symbol === positionForm.stock_symbol && s.market === positionForm.stock_market)
+            if (existing) {
+              stockId = existing.id
+            } else {
+              toast('添加股票失败', 'error')
+              return
+            }
+          } catch (e) {
+            toast(e instanceof Error ? e.message : '添加股票失败', 'error')
+            return
+          }
         }
       }
-    }
 
-    const payload = {
-      account_id: positionForm.account_id,
-      stock_id: stockId,
-      cost_price: parseFloat(positionForm.cost_price),
-      quantity: parseInt(positionForm.quantity),
-      invested_amount: positionForm.invested_amount ? parseFloat(positionForm.invested_amount) : null,
-      trading_style: positionForm.trading_style,  // 空字符串表示清空
+      const payload = {
+        account_id: positionForm.account_id,
+        stock_id: stockId,
+        cost_price: parseFloat(positionForm.cost_price),
+        quantity: parseInt(positionForm.quantity),
+        invested_amount: positionForm.invested_amount ? parseFloat(positionForm.invested_amount) : null,
+        trading_style: positionForm.trading_style,  // 空字符串表示清空
+      }
+      if (editPositionId) {
+        await fetchAPI(`/positions/${editPositionId}`, { method: 'PUT', body: JSON.stringify(payload) })
+      } else {
+        await fetchAPI('/positions', { method: 'POST', body: JSON.stringify(payload) })
+      }
+      setPositionDialogOpen(false)
+      loadPortfolio()
+      toast(editPositionId ? '持仓已更新' : '持仓已添加', 'success')
+    } catch (e) {
+      toast(e instanceof Error ? e.message : '保存持仓失败', 'error')
     }
-    if (editPositionId) {
-      await fetchAPI(`/positions/${editPositionId}`, { method: 'PUT', body: JSON.stringify(payload) })
-    } else {
-      await fetchAPI('/positions', { method: 'POST', body: JSON.stringify(payload) })
-    }
-    setPositionDialogOpen(false)
-    loadPortfolio()
-    toast(editPositionId ? '持仓已更新' : '持仓已添加', 'success')
   }
 
   const handleDeletePosition = async (id: number) => {
     if (!confirm('确定删除该持仓？')) return
-    await fetchAPI(`/positions/${id}`, { method: 'DELETE' })
-    loadPortfolio()
-    toast('持仓已删除', 'success')
+    try {
+      await fetchAPI(`/positions/${id}`, { method: 'DELETE' })
+      loadPortfolio()
+      toast('持仓已删除', 'success')
+    } catch (e) {
+      toast(e instanceof Error ? e.message : '删除持仓失败', 'error')
+    }
   }
 
   // ========== Agent handlers ==========
   const toggleAgent = async (stock: Stock, agentName: string) => {
-    const current = stock.agents || []
-    const isAssigned = current.some(a => a.agent_name === agentName)
-    const newAgents = isAssigned
-      ? current.filter(a => a.agent_name !== agentName)
-      : [...current, { agent_name: agentName, schedule: '', ai_model_id: null, notify_channel_ids: [] }]
-    await fetchAPI(`/stocks/${stock.id}/agents`, { method: 'PUT', body: JSON.stringify({ agents: newAgents }) })
-    load()
-    setAgentDialogStock(prev => prev ? { ...prev, agents: newAgents } : null)
+    try {
+      const current = stock.agents || []
+      const isAssigned = current.some(a => a.agent_name === agentName)
+      const newAgents = isAssigned
+        ? current.filter(a => a.agent_name !== agentName)
+        : [...current, { agent_name: agentName, schedule: '', ai_model_id: null, notify_channel_ids: [] }]
+      await fetchAPI(`/stocks/${stock.id}/agents`, { method: 'PUT', body: JSON.stringify({ agents: newAgents }) })
+      load()
+      setAgentDialogStock(prev => prev ? { ...prev, agents: newAgents } : null)
+    } catch (e) {
+      toast(e instanceof Error ? e.message : '更新 Agent 绑定失败', 'error')
+    }
   }
 
   const triggerStockAgent = async (stockId: number, agentName: string) => {
@@ -922,14 +1211,31 @@ export default function StocksPage() {
     setAgentDialogStock(null)
     try {
       // 手动触发时跳过节流，方便测试
-      const resp = await fetchAPI<{ result: AgentResult }>(`/stocks/${stockId}/agents/${agentName}/trigger?bypass_throttle=true`, { method: 'POST' })
+      const resp = await fetchAPI<{ result: AgentResult; success?: boolean; message?: string }>(
+        `/stocks/${stockId}/agents/${agentName}/trigger?bypass_throttle=true`,
+        { method: 'POST' }
+      )
       const result = resp?.result
       if (result) {
         // 仅提示，不再弹出结果弹窗，避免干扰
-        toast(result.should_alert ? 'AI 建议关注' : 'AI 判断无需关注', result.should_alert ? 'success' : 'info')
+        if (result.success === false) {
+          toast(result.message || result.content || '执行未通过', 'info')
+          return
+        }
+        const isSkipped = !!result.skipped || /已跳过执行|非交易时段/.test(result.content || '')
+        if (isSkipped) {
+          toast(result.content || '当前非交易时段，已跳过执行', 'info')
+        } else {
+          toast(result.should_alert ? 'AI 建议关注' : 'AI 判断无需关注', result.should_alert ? 'success' : 'info')
+        }
       }
     } catch (e) {
-      toast(e instanceof Error ? e.message : '触发失败', 'error')
+      const msg = e instanceof Error ? e.message : '触发失败'
+      if (/非交易时段|跳过执行/.test(msg)) {
+        toast(msg, 'info')
+      } else {
+        toast(msg, 'error')
+      }
     } finally {
       setTriggeringAgent(null)
       setRunningAgents(prev => ({ ...prev, [stockId]: null }))
@@ -937,35 +1243,47 @@ export default function StocksPage() {
   }
 
   const updateStockAgentModel = async (stock: Stock, agentName: string, modelId: number | null) => {
-    const newAgents = (stock.agents || []).map(a =>
-      a.agent_name === agentName ? { ...a, ai_model_id: modelId } : a
-    )
-    await fetchAPI(`/stocks/${stock.id}/agents`, { method: 'PUT', body: JSON.stringify({ agents: newAgents }) })
-    load()
-    setAgentDialogStock(prev => prev ? { ...prev, agents: newAgents } : null)
+    try {
+      const newAgents = (stock.agents || []).map(a =>
+        a.agent_name === agentName ? { ...a, ai_model_id: modelId } : a
+      )
+      await fetchAPI(`/stocks/${stock.id}/agents`, { method: 'PUT', body: JSON.stringify({ agents: newAgents }) })
+      load()
+      setAgentDialogStock(prev => prev ? { ...prev, agents: newAgents } : null)
+    } catch (e) {
+      toast(e instanceof Error ? e.message : '更新 Agent 模型失败', 'error')
+    }
   }
 
   const toggleStockAgentChannel = async (stock: Stock, agentName: string, channelId: number) => {
-    const newAgents = (stock.agents || []).map(a => {
-      if (a.agent_name !== agentName) return a
-      const current = a.notify_channel_ids || []
-      const newIds = current.includes(channelId)
-        ? current.filter(id => id !== channelId)
-        : [...current, channelId]
-      return { ...a, notify_channel_ids: newIds }
-    })
-    await fetchAPI(`/stocks/${stock.id}/agents`, { method: 'PUT', body: JSON.stringify({ agents: newAgents }) })
-    load()
-    setAgentDialogStock(prev => prev ? { ...prev, agents: newAgents } : null)
+    try {
+      const newAgents = (stock.agents || []).map(a => {
+        if (a.agent_name !== agentName) return a
+        const current = a.notify_channel_ids || []
+        const newIds = current.includes(channelId)
+          ? current.filter(id => id !== channelId)
+          : [...current, channelId]
+        return { ...a, notify_channel_ids: newIds }
+      })
+      await fetchAPI(`/stocks/${stock.id}/agents`, { method: 'PUT', body: JSON.stringify({ agents: newAgents }) })
+      load()
+      setAgentDialogStock(prev => prev ? { ...prev, agents: newAgents } : null)
+    } catch (e) {
+      toast(e instanceof Error ? e.message : '更新 Agent 通知配置失败', 'error')
+    }
   }
 
   const updateStockAgentSchedule = async (stock: Stock, agentName: string, schedule: string) => {
-    const newAgents = (stock.agents || []).map(a =>
-      a.agent_name === agentName ? { ...a, schedule } : a
-    )
-    await fetchAPI(`/stocks/${stock.id}/agents`, { method: 'PUT', body: JSON.stringify({ agents: newAgents }) })
-    load()
-    setAgentDialogStock(prev => prev ? { ...prev, agents: newAgents } : null)
+    try {
+      const newAgents = (stock.agents || []).map(a =>
+        a.agent_name === agentName ? { ...a, schedule } : a
+      )
+      await fetchAPI(`/stocks/${stock.id}/agents`, { method: 'PUT', body: JSON.stringify({ agents: newAgents }) })
+      load()
+      setAgentDialogStock(prev => prev ? { ...prev, agents: newAgents } : null)
+    } catch (e) {
+      toast(e instanceof Error ? e.message : '更新 Agent 调度失败', 'error')
+    }
   }
 
   // ========== Helpers ==========
@@ -997,26 +1315,33 @@ export default function StocksPage() {
     return quotes[symbol] || null
   }
 
+  const getPriceAlertSummary = (symbol: string, market: string) => {
+    const key = `${String(market || 'CN').toUpperCase()}:${String(symbol || '').toUpperCase()}`
+    return priceAlertSummaryMap[key] || { total: 0, enabled: 0 }
+  }
+
   // 获取股票的建议信息（优先使用建议池，包含来源和时间信息）
   const getSuggestionForStock = (symbol: string, market: string, hasPosition?: boolean): { suggestion: SuggestionInfo | null; kline: KlineSummary | null } => {
     const key = `${market || 'CN'}:${symbol}`
     // 优先使用建议池的建议（包含来源和时间信息）
     const poolSug = poolSuggestions[symbol]
-    if (poolSug && !poolSug.is_expired) {
+    if (poolSug) {
       const preloadedKline = klineSummaries[key] || (suggestions[symbol]?.kline as any) || null
       return {
         suggestion: {
+          id: poolSug.id,
           action: poolSug.action,
           action_label: poolSug.action_label,
           signal: poolSug.signal,
           reason: poolSug.reason,
-          should_alert: true,
+          should_alert: poolSug.should_alert ?? (['alert', 'avoid', 'sell', 'reduce'].includes(poolSug.action)),
           agent_name: poolSug.agent_name,
           agent_label: poolSug.agent_label,
           created_at: poolSug.created_at,
           is_expired: poolSug.is_expired,
           prompt_context: poolSug.prompt_context,
           ai_response: poolSug.ai_response,
+          meta: poolSug.meta,
         },
         // 优先使用本页并发预取的 kline 摘要，确保徽章与弹窗一致且免加载
         kline: preloadedKline,
@@ -1050,6 +1375,14 @@ export default function StocksPage() {
     const pct = assets > 0 ? (mv / assets * 100) : 0
     return { mv, assets, pct }
   }, [portfolio])
+
+  const positionsCount = useMemo(() => {
+    return (portfolio?.accounts || []).reduce((acc, a) => acc + (a.positions?.length || 0), 0)
+  }, [portfolio])
+
+  const watchlistCount = useMemo(() => {
+    return stocks.length
+  }, [stocks])
 
   const toggleAccountExpanded = (id: number) => {
     setExpandedAccounts(prev => {
@@ -1157,19 +1490,21 @@ export default function StocksPage() {
                   </Select>
                 )}
               </div>
-              <div className="w-px h-4 bg-border" />
-              <div className="flex items-center gap-1.5">
-                <Switch checked={enableAIAnalysis} onCheckedChange={setEnableAIAnalysis} className="scale-90" />
-                <span className="text-[11px] text-muted-foreground">AI 建议</span>
-                {poolSuggestionsLoading && (
-                  <span className="w-3 h-3 border-2 border-primary/30 border-t-primary rounded-full animate-spin" />
-                )}
-                {!poolSuggestionsLoading && Object.keys(poolSuggestions).length > 0 && (
-                  <span className="text-[10px] text-primary">
-                    {Object.keys(poolSuggestions).length}
-                  </span>
-                )}
-              </div>
+              {(poolSuggestionsLoading || Object.keys(poolSuggestions).length > 0) && (
+                <>
+                  <div className="w-px h-4 bg-border" />
+                  <div className="flex items-center gap-1.5 text-[11px] text-muted-foreground">
+                    {poolSuggestionsLoading && (
+                      <span className="w-3 h-3 border-2 border-primary/30 border-t-primary rounded-full animate-spin" />
+                    )}
+                    {!poolSuggestionsLoading && Object.keys(poolSuggestions).length > 0 && (
+                      <span className="text-[10px] text-primary">
+                        {Object.keys(poolSuggestions).length}
+                      </span>
+                    )}
+                  </div>
+                </>
+              )}
               {lastRefreshTime && (
                 <>
                   <div className="w-px h-4 bg-border" />
@@ -1230,14 +1565,14 @@ export default function StocksPage() {
                 </Select>
               )}
             </div>
-            <div className="w-px h-4 bg-border" />
-            <div className="flex items-center gap-1">
-              <Switch checked={enableAIAnalysis} onCheckedChange={setEnableAIAnalysis} className="scale-90" />
-              <span className="text-[11px] text-muted-foreground">AI 建议</span>
-              {suggestionsLoading && (
-                <span className="w-3 h-3 border-2 border-primary/30 border-t-primary rounded-full animate-spin" />
-              )}
-            </div>
+            {poolSuggestionsLoading && (
+              <>
+                <div className="w-px h-4 bg-border" />
+                <div className="flex items-center gap-1 text-[11px] text-muted-foreground">
+                  <span className="w-3 h-3 border-2 border-primary/30 border-t-primary rounded-full animate-spin" />
+                </div>
+              </>
+            )}
           </div>
           {lastRefreshTime && (
             <span className="text-[10px] text-muted-foreground/60">
@@ -1355,6 +1690,32 @@ export default function StocksPage() {
         </div>
       ) : null}
 
+      {/* Tabs: Positions / Watchlist */}
+      <div className="mb-4">
+        <div className="inline-flex items-center gap-1 p-1 rounded-lg bg-accent/30">
+          <button
+            onClick={() => setViewTab('positions')}
+            className={`px-3 py-1.5 rounded-md text-[12px] transition-colors ${
+              viewTab === 'positions'
+                ? 'bg-background text-foreground shadow-sm'
+                : 'text-muted-foreground hover:text-foreground'
+            }`}
+          >
+            持仓 <span className="ml-1 font-mono text-[11px] opacity-70">{positionsCount}</span>
+          </button>
+          <button
+            onClick={() => setViewTab('watchlist')}
+            className={`px-3 py-1.5 rounded-md text-[12px] transition-colors ${
+              viewTab === 'watchlist'
+                ? 'bg-background text-foreground shadow-sm'
+                : 'text-muted-foreground hover:text-foreground'
+            }`}
+          >
+            关注 <span className="ml-1 font-mono text-[11px] opacity-70">{watchlistCount}</span>
+          </button>
+        </div>
+      </div>
+
       {/* Add Stock Dialog */}
       <Dialog open={showStockForm} onOpenChange={(open) => { setShowStockForm(open); if (!open) { setSearchQuery(''); setSearchMarket('') } }}>
         <DialogContent className="max-w-lg">
@@ -1449,18 +1810,19 @@ export default function StocksPage() {
       </Dialog>
 
       {/* Accounts & Positions */}
-      {portfolio && portfolio.accounts.length === 0 ? (
-        <div className="card flex flex-col items-center justify-center py-20">
-          <div className="w-14 h-14 rounded-xl bg-primary/10 flex items-center justify-center mb-4">
-            <Building2 className="w-6 h-6 text-primary" />
+      {viewTab === 'positions' && (
+        portfolio && portfolio.accounts.length === 0 ? (
+          <div className="card flex flex-col items-center justify-center py-20">
+            <div className="w-14 h-14 rounded-xl bg-primary/10 flex items-center justify-center mb-4">
+              <Building2 className="w-6 h-6 text-primary" />
+            </div>
+            <p className="text-[15px] font-semibold text-foreground">还没有账户</p>
+            <p className="text-[13px] text-muted-foreground mt-1.5">点击"添加账户"创建你的第一个交易账户</p>
           </div>
-          <p className="text-[15px] font-semibold text-foreground">还没有账户</p>
-          <p className="text-[13px] text-muted-foreground mt-1.5">点击"添加账户"创建你的第一个交易账户</p>
-        </div>
-      ) : (
-        <div className="space-y-4">
-          {portfolio?.accounts.map(account => (
-            <div key={account.id} className="card overflow-hidden">
+        ) : (
+          <div className="space-y-4">
+            {portfolio?.accounts.map(account => (
+              <div key={account.id} className="card overflow-hidden">
               {/* Account Header */}
               <div
                 className="flex flex-col md:flex-row md:items-center justify-between p-3 md:p-4 cursor-pointer hover:bg-accent/30 transition-colors gap-2"
@@ -1546,11 +1908,49 @@ export default function StocksPage() {
                                 ? (pos.pnl > 0 ? 'text-rose-500' : pos.pnl < 0 ? 'text-emerald-500' : 'text-muted-foreground')
                                 : 'text-muted-foreground'
                               return (
-                                <tr key={pos.id} className={`group hover:bg-accent/30 transition-colors ${i > 0 ? 'border-t border-border/20' : ''}`}>
+                                <tr
+                                  key={pos.id}
+                                  draggable
+                                  onDragStart={(e) => {
+                                    positionDragSnapshotRef.current = portfolioRaw ? JSON.parse(JSON.stringify(portfolioRaw)) : null
+                                    setDraggingPositionId(pos.id)
+                                    setDraggingPositionAccountId(account.id)
+                                    e.dataTransfer.effectAllowed = 'move'
+                                  }}
+                                  onDragOver={(e) => {
+                                    e.preventDefault()
+                                    e.dataTransfer.dropEffect = 'move'
+                                    if (draggingPositionId != null && draggingPositionAccountId === account.id) {
+                                      previewPositionReorder(account.id, draggingPositionId, pos.id)
+                                    }
+                                  }}
+                                  onDrop={(e) => {
+                                    e.preventDefault()
+                                    if (draggingPositionId != null && draggingPositionAccountId === account.id) {
+                                      commitPositionReorder(account.id)
+                                    }
+                                    setDraggingPositionId(null)
+                                    setDraggingPositionAccountId(null)
+                                    positionDragSnapshotRef.current = null
+                                  }}
+                                  onDragEnd={() => {
+                                    setDraggingPositionId(null)
+                                    setDraggingPositionAccountId(null)
+                                    positionDragSnapshotRef.current = null
+                                  }}
+                                  className={`group hover:bg-accent/30 transition-colors ${i > 0 ? 'border-t border-border/20' : ''} ${draggingPositionId === pos.id ? 'opacity-60' : ''}`}
+                                >
                                   <td className="px-4 py-2.5">
                                     <span className={`text-[9px] px-1 py-0.5 rounded mr-1.5 ${badge.style}`}>{badge.label}</span>
-                                    <span className="font-mono text-[12px] font-semibold text-foreground">{pos.symbol}</span>
-                                    <span className="ml-1.5 text-[12px] text-muted-foreground">{pos.name}</span>
+                                    <span className="font-mono text-[12px] font-semibold text-foreground">
+                                      {pos.symbol}
+                                    </span>
+                                    <button
+                                      className="ml-1.5 text-[12px] text-muted-foreground hover:text-primary"
+                                      onClick={() => openStockDetail(pos.symbol, pos.market, pos.name, true)}
+                                    >
+                                      {pos.name}
+                                    </button>
                                     {(() => {
                                       const { suggestion, kline } = getSuggestionForStock(pos.symbol, pos.market, true)
                                       return (suggestion || kline) ? (
@@ -1632,12 +2032,21 @@ export default function StocksPage() {
                                     )}
                                   </td>
                                   <td className="px-4 py-2.5 text-center">
-                                    <div className="flex items-center justify-center gap-1">
+                                    <div className="flex items-center justify-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
                                       {(() => { const { suggestion, kline } = getSuggestionForStock(pos.symbol, pos.market, true); return (!suggestion && !kline) ? (
                                         <Button variant="ghost" size="icon" className="h-7 w-7" onClick={() => openKlineDialog(pos.symbol, pos.market, pos.name, true)} title="K线指标"><BarChart3 className="w-3 h-3" /></Button>
                                       ) : null })()}
+                                      <StockPriceAlertPanel
+                                        mode="icon"
+                                        stockId={pos.stock_id}
+                                        symbol={pos.symbol}
+                                        market={pos.market}
+                                        stockName={pos.name}
+                                        initialTotal={getPriceAlertSummary(pos.symbol, pos.market).total}
+                                        initialEnabled={getPriceAlertSummary(pos.symbol, pos.market).enabled}
+                                        onChanged={loadPriceAlertSummaries}
+                                      />
                                       <Button variant="ghost" size="icon" className="h-7 w-7" onClick={() => openNewsDialog(pos.name)} title="相关资讯"><Newspaper className="w-3 h-3" /></Button>
-                                      <Button variant="ghost" size="icon" className="h-7 w-7" onClick={() => openStockDetail(pos.symbol, pos.market)} title="详情"><ExternalLink className="w-3 h-3" /></Button>
                                       <Button variant="ghost" size="icon" className="h-7 w-7" onClick={() => openPositionDialog(account.id, pos)}><Pencil className="w-3 h-3" /></Button>
                                       <Button variant="ghost" size="icon" className="h-7 w-7 hover:text-destructive" onClick={() => handleDeletePosition(pos.id)}><Trash2 className="w-3 h-3" /></Button>
                                     </div>
@@ -1661,13 +2070,51 @@ export default function StocksPage() {
                             ? (pos.pnl > 0 ? 'text-rose-500' : pos.pnl < 0 ? 'text-emerald-500' : 'text-muted-foreground')
                             : 'text-muted-foreground'
                           return (
-                            <div key={pos.id} className="p-3 hover:bg-accent/30 transition-colors">
+                            <div
+                              key={pos.id}
+                              draggable
+                              onDragStart={(e) => {
+                                positionDragSnapshotRef.current = portfolioRaw ? JSON.parse(JSON.stringify(portfolioRaw)) : null
+                                setDraggingPositionId(pos.id)
+                                setDraggingPositionAccountId(account.id)
+                                e.dataTransfer.effectAllowed = 'move'
+                              }}
+                              onDragOver={(e) => {
+                                e.preventDefault()
+                                e.dataTransfer.dropEffect = 'move'
+                                if (draggingPositionId != null && draggingPositionAccountId === account.id) {
+                                  previewPositionReorder(account.id, draggingPositionId, pos.id)
+                                }
+                              }}
+                              onDrop={(e) => {
+                                e.preventDefault()
+                                if (draggingPositionId != null && draggingPositionAccountId === account.id) {
+                                  commitPositionReorder(account.id)
+                                }
+                                setDraggingPositionId(null)
+                                setDraggingPositionAccountId(null)
+                                positionDragSnapshotRef.current = null
+                              }}
+                              onDragEnd={() => {
+                                setDraggingPositionId(null)
+                                setDraggingPositionAccountId(null)
+                                positionDragSnapshotRef.current = null
+                              }}
+                              className={`p-3 hover:bg-accent/30 transition-colors ${draggingPositionId === pos.id ? 'opacity-60' : ''}`}
+                            >
                               {/* Row 1: Stock info + Current price */}
                               <div className="flex items-center justify-between mb-2">
                                 <div className="flex items-center gap-1.5 flex-wrap">
                                   <span className={`text-[9px] px-1 py-0.5 rounded ${badge.style}`}>{badge.label}</span>
-                                  <span className="font-mono text-[12px] font-semibold text-foreground">{pos.symbol}</span>
-                                  <span className="text-[12px] text-muted-foreground">{pos.name}</span>
+                                  <span className="font-mono text-[12px] font-semibold text-foreground">
+                                    {pos.symbol}
+                                  </span>
+                                  <button
+                                    className="text-[12px] text-muted-foreground hover:text-primary"
+                                    onClick={() => openStockDetail(pos.symbol, pos.market, pos.name, true)}
+                                  >
+                                    {pos.name}
+                                  </button>
                                   {pos.trading_style && (
                                     <span className={`text-[9px] px-1 py-0.5 rounded ${pos.trading_style === 'short' ? 'bg-rose-500/10 text-rose-600' : pos.trading_style === 'long' ? 'bg-blue-500/10 text-blue-600' : 'bg-amber-500/10 text-amber-600'}`}>
                                       {pos.trading_style === 'short' ? '短' : pos.trading_style === 'long' ? '长' : '波'}
@@ -1734,8 +2181,17 @@ export default function StocksPage() {
                                   {(() => { const { suggestion, kline } = getSuggestionForStock(pos.symbol, pos.market, true); return (!suggestion && !kline) ? (
                                     <Button variant="ghost" size="icon" className="h-7 w-7" onClick={() => openKlineDialog(pos.symbol, pos.market, pos.name, true)} title="K线指标"><BarChart3 className="w-3 h-3" /></Button>
                                   ) : null })()}
+                                  <StockPriceAlertPanel
+                                    mode="icon"
+                                    stockId={pos.stock_id}
+                                    symbol={pos.symbol}
+                                    market={pos.market}
+                                    stockName={pos.name}
+                                    initialTotal={getPriceAlertSummary(pos.symbol, pos.market).total}
+                                    initialEnabled={getPriceAlertSummary(pos.symbol, pos.market).enabled}
+                                    onChanged={loadPriceAlertSummaries}
+                                  />
                                   <Button variant="ghost" size="icon" className="h-7 w-7" onClick={() => openNewsDialog(pos.name)}><Newspaper className="w-3 h-3" /></Button>
-                                  <Button variant="ghost" size="icon" className="h-7 w-7" onClick={() => openStockDetail(pos.symbol, pos.market)} title="详情"><ExternalLink className="w-3 h-3" /></Button>
                                   <Button variant="ghost" size="icon" className="h-7 w-7" onClick={() => openPositionDialog(account.id, pos)}><Pencil className="w-3 h-3" /></Button>
                                   <Button variant="ghost" size="icon" className="h-7 w-7 hover:text-destructive" onClick={() => handleDeletePosition(pos.id)}><Trash2 className="w-3 h-3" /></Button>
                                 </div>
@@ -1751,207 +2207,226 @@ export default function StocksPage() {
             </div>
           ))}
         </div>
+        )
       )}
 
-      {/* Stocks without positions (for agent config) */}
-      {(() => {
-        const allPositionedSymbols = new Set(
-          portfolio?.accounts.flatMap(a => a.positions.map(p => p.symbol)) || []
-        )
-        const filteredStocks = stocks.filter(s => {
-          if (!s.enabled) return false
-          if (stockListFilter && s.market !== stockListFilter) return false
-          if (showOnlyWithoutPosition && allPositionedSymbols.has(s.symbol)) return false
-          return true
-        })
-        
-        if (filteredStocks.length === 0) return null
-        
-        return (
-          <div className="mt-6 card p-4">
-            <div className="flex items-center justify-between mb-3">
-              <h3 className="text-[13px] font-semibold text-foreground">自选股列表</h3>
-              <div className="flex items-center gap-3">
-                <div className="flex items-center gap-2">
-                  <Switch
-                    id="show-only-without-position"
-                    checked={showOnlyWithoutPosition}
-                    onCheckedChange={setShowOnlyWithoutPosition}
-                    className="scale-90"
-                  />
-                  <label htmlFor="show-only-without-position" className="text-[11px] text-muted-foreground cursor-pointer">
-                    只显示未持仓
-                  </label>
-                </div>
-                <div className="flex items-center gap-1">
-                  {[
-                    { value: '', label: '全部', count: stocks.filter(s => s.enabled && (!showOnlyWithoutPosition || !allPositionedSymbols.has(s.symbol))).length },
-                    { value: 'CN', label: 'A股', count: stocks.filter(s => s.enabled && s.market === 'CN' && (!showOnlyWithoutPosition || !allPositionedSymbols.has(s.symbol))).length },
-                    { value: 'HK', label: '港股', count: stocks.filter(s => s.enabled && s.market === 'HK' && (!showOnlyWithoutPosition || !allPositionedSymbols.has(s.symbol))).length },
-                    { value: 'US', label: '美股', count: stocks.filter(s => s.enabled && s.market === 'US' && (!showOnlyWithoutPosition || !allPositionedSymbols.has(s.symbol))).length },
-                  ].map(opt => (
-                    <button
-                      key={opt.value}
-                      onClick={() => setStockListFilter(opt.value)}
-                      className={`text-[11px] px-2 py-0.5 rounded transition-colors ${
-                        stockListFilter === opt.value
-                          ? 'bg-primary text-primary-foreground'
-                          : 'bg-accent/50 text-muted-foreground hover:bg-accent'
-                      }`}
-                    >
-                      {opt.label} ({opt.count})
-                    </button>
-                  ))}
-                </div>
-              </div>
-            </div>
-            
-            {/* Desktop Grid - Responsive columns (1-5 columns based on screen width) */}
-            <div className="hidden md:grid md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 2xl:grid-cols-5 gap-3">
-              {filteredStocks.map((stock) => {
-                const quote = getStockQuote(stock.symbol)
-                const badge = marketBadge(stock.market)
-                const changeColor = quote?.change_pct != null
-                  ? (quote.change_pct > 0 ? 'text-rose-500' : quote.change_pct < 0 ? 'text-emerald-500' : 'text-muted-foreground')
-                  : 'text-muted-foreground'
-                
-                return (
-                  <div key={stock.id} className="flex flex-col gap-2 p-3 rounded-lg bg-accent/30 hover:bg-accent/50 transition-colors border border-border/20">
-                    {/* 股票信息 */}
-                    <div className="flex-1 min-w-0">
-                      <div className="flex items-center gap-2 mb-1">
-                        <span className={`text-[9px] px-1 py-0.5 rounded ${badge.style}`}>{badge.label}</span>
-                        <span className="font-mono text-[11px] font-semibold text-foreground">{stock.symbol}</span>
-                        <span className="text-[11px] text-muted-foreground truncate">{stock.name}</span>
-                      </div>
-                      <div className={`font-mono text-[13px] ${changeColor} font-semibold mb-1.5`}>
-                        {quote?.current_price != null ? (
-                          <>
-                            {quote.current_price.toFixed(2)}
-                            {quote.change_pct != null && (
-                              <span className="ml-2 text-[11px]">
-                                {quote.change_pct >= 0 ? '+' : ''}{quote.change_pct.toFixed(2)}%
-                              </span>
-                            )}
-                          </>
-                        ) : '—'}
-                      </div>
-                      {(() => {
-                        const { suggestion, kline } = getSuggestionForStock(stock.symbol, stock.market, false)
-                        return (suggestion || kline) ? (
-                          <div className="mb-2">
-                            <SuggestionBadge
-                              suggestion={suggestion}
-                              stockName={stock.name}
-                              stockSymbol={stock.symbol}
-                              kline={kline}
-                              market={stock.market}
-                              hasPosition={false}
-                            />
-                          </div>
-                        ) : null
-                      })()}
-                    </div>
-                    
-                    {/* 操作区域 */}
-                    <div className="flex items-center justify-between gap-2 pt-2 border-t border-border/20">
-                      <button onClick={() => setAgentDialogStock(stock)} className="text-[10px] px-2 py-1 rounded bg-accent hover:bg-accent/80 transition-colors flex-shrink-0">
-                        {stock.agents && stock.agents.length > 0 ? (
-                          <span className="flex items-center gap-1">
-                            <Bot className="w-3 h-3" />
-                            {stock.agents.length}
-                          </span>
-                        ) : (
-                          <span className="text-muted-foreground/70 flex items-center gap-1">
-                            <Bot className="w-3 h-3" />
-                          </span>
-                        )}
-                      </button>
-                      <div className="flex items-center gap-0.5">
-                        {(() => { const { suggestion, kline } = getSuggestionForStock(stock.symbol, stock.market, false); return (!suggestion && !kline) ? (
-                          <Button variant="ghost" size="icon" className="h-7 w-7" onClick={() => openKlineDialog(stock.symbol, stock.market, stock.name, false)} title="K线指标"><BarChart3 className="w-3 h-3" /></Button>
-                        ) : null })()}
-                        <Button variant="ghost" size="icon" className="h-7 w-7" onClick={() => openNewsDialog(stock.name)} title="相关资讯"><Newspaper className="w-3 h-3" /></Button>
-                        <Button variant="ghost" size="icon" className="h-7 w-7" onClick={() => openStockDetail(stock.symbol, stock.market)} title="详情"><ExternalLink className="w-3 h-3" /></Button>
-                        <Button variant="ghost" size="icon" className="h-7 w-7 hover:text-destructive" onClick={() => handleDeleteStock(stock.id)}><Trash2 className="w-3 h-3" /></Button>
-                      </div>
-                    </div>
-                  </div>
-                )
-              })}
-            </div>
-
-            {/* Mobile Cards */}
-            <div className="md:hidden space-y-2">
-              {filteredStocks.map(stock => {
-                const quote = getStockQuote(stock.symbol)
-                const badge = marketBadge(stock.market)
-                const changeColor = quote?.change_pct != null
-                  ? (quote.change_pct > 0 ? 'text-rose-500' : quote.change_pct < 0 ? 'text-emerald-500' : 'text-muted-foreground')
-                  : 'text-muted-foreground'
-                
-                return (
-                  <div key={stock.id} className="p-3 rounded-lg bg-accent/30 hover:bg-accent/50 transition-colors">
-                    <div className="flex items-start justify-between mb-2">
-                      <div className="flex-1">
-                        <div className="flex items-center gap-2 mb-1">
-                          <span className={`text-[9px] px-1 py-0.5 rounded ${badge.style}`}>{badge.label}</span>
-                          <span className="font-mono text-[11px] text-muted-foreground">{stock.symbol}</span>
-                          <span className="text-[12px] text-foreground font-medium">{stock.name}</span>
-                        </div>
-                        {quote && (
-                          <div className={`font-mono text-[13px] ${changeColor} font-semibold`}>
-                            {quote.current_price?.toFixed(2)}
-                            {quote.change_pct != null && (
-                              <span className="ml-2">
-                                {quote.change_pct >= 0 ? '+' : ''}{quote.change_pct.toFixed(2)}%
-                              </span>
-                            )}
-                          </div>
-                        )}
-                      </div>
-                      <Button variant="ghost" size="icon" className="h-7 w-7 hover:text-destructive" onClick={() => handleDeleteStock(stock.id)}>
-                        <X className="w-3 h-3" />
-                      </Button>
-                    </div>
-                    
-                    {(() => {
-                      const { suggestion, kline } = getSuggestionForStock(stock.symbol, stock.market, false)
-                      return (suggestion || kline) ? (
-                        <div className="mb-2">
-                          <SuggestionBadge
-                            suggestion={suggestion}
-                            stockName={stock.name}
-                            stockSymbol={stock.symbol}
-                            kline={kline}
-                            market={stock.market}
-                            hasPosition={false}
-                          />
-                        </div>
-                      ) : null
-                    })()}
-                    
-                    <div className="flex items-center justify-between pt-2 border-t border-border/20">
-                      <button onClick={() => setAgentDialogStock(stock)} className="flex items-center gap-1.5 text-[11px]">
-                        {stock.agents && stock.agents.length > 0 ? (
-                          <Badge variant="default" className="text-[10px]">{stock.agents.length} Agent</Badge>
-                        ) : (
-                          <span className="text-muted-foreground/50 flex items-center gap-1"><Bot className="w-3 h-3" /> 未配置</span>
-                        )}
-                      </button>
-                      <div className="flex items-center gap-1">
-                        <Button variant="ghost" size="icon" className="h-7 w-7" onClick={() => openKlineDialog(stock.symbol, stock.market, stock.name, false)} title="K线指标"><BarChart3 className="w-3 h-3" /></Button>
-                        <Button variant="ghost" size="icon" className="h-7 w-7" onClick={() => openNewsDialog(stock.name)} title="相关资讯"><Newspaper className="w-3 h-3" /></Button>
-                        <Button variant="ghost" size="icon" className="h-7 w-7" onClick={() => openStockDetail(stock.symbol, stock.market)} title="详情"><ExternalLink className="w-3 h-3" /></Button>
-                      </div>
-                    </div>
-                  </div>
-                )
-              })}
+      {/* Watchlist */}
+      {viewTab === 'watchlist' && (
+        <div className="card p-4">
+          <div className="flex items-center justify-between mb-3">
+            <h3 className="text-[13px] font-semibold text-foreground">关注列表</h3>
+            <div className="flex items-center gap-1">
+              {[
+                { value: '', label: '全部', count: stocks.length },
+                { value: 'CN', label: 'A股', count: stocks.filter(s => s.market === 'CN').length },
+                { value: 'HK', label: '港股', count: stocks.filter(s => s.market === 'HK').length },
+                { value: 'US', label: '美股', count: stocks.filter(s => s.market === 'US').length },
+              ].map(opt => (
+                <button
+                  key={opt.value}
+                  onClick={() => setStockListFilter(opt.value)}
+                  className={`text-[11px] px-2 py-0.5 rounded transition-colors ${
+                    stockListFilter === opt.value
+                      ? 'bg-primary text-primary-foreground'
+                      : 'bg-accent/50 text-muted-foreground hover:bg-accent'
+                  }`}
+                >
+                  {opt.label} ({opt.count})
+                </button>
+              ))}
             </div>
           </div>
-        )
-      })()}
+
+          <div className="flex items-center justify-between mb-3">
+            <div className="text-[11px] text-muted-foreground">筛选</div>
+            <div className="flex items-center gap-2">
+              <button
+                onClick={() => setWatchlistOnlyAlerts(!watchlistOnlyAlerts)}
+                className={`text-[11px] px-2.5 py-1 rounded-md border transition-colors ${
+                  watchlistOnlyAlerts
+                    ? 'bg-rose-500/10 border-rose-500/30 text-rose-600'
+                    : 'bg-accent/30 border-border/50 text-muted-foreground hover:border-rose-500/30'
+                }`}
+                title="只显示需要关注/预警的股票"
+              >
+                仅预警
+              </button>
+            </div>
+          </div>
+          {stocks.length === 0 ? (
+            <div className="py-12 text-center">
+              <div className="text-[13px] text-muted-foreground">还没有添加关注股票</div>
+              <div className="mt-2 text-[11px] text-muted-foreground/70">点击右上角“添加股票”开始</div>
+            </div>
+          ) : (
+            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
+              {stocks
+                .filter(s => !stockListFilter || s.market === stockListFilter)
+                .sort((a, b) => Number(a.sort_order || 0) - Number(b.sort_order || 0) || a.id - b.id)
+                .filter(stock => {
+                  if (!watchlistOnlyAlerts) return true
+                  const { suggestion } = getSuggestionForStock(stock.symbol, stock.market, false)
+                  return !!suggestion?.should_alert
+                })
+                .map((stock) => {
+                const quote = getStockQuote(stock.symbol)
+                const changeColor = quote?.change_pct != null
+                  ? (quote.change_pct > 0 ? 'text-rose-500' : quote.change_pct < 0 ? 'text-emerald-500' : 'text-muted-foreground')
+                  : 'text-muted-foreground'
+                const { suggestion, kline } = getSuggestionForStock(stock.symbol, stock.market, false)
+                return (
+                  <div
+                    key={stock.id}
+                    draggable={stockListFilter === '' && !watchlistOnlyAlerts}
+                    onDragStart={(e) => {
+                      if (stockListFilter !== '' || watchlistOnlyAlerts) return
+                      watchDragSnapshotRef.current = stocks
+                      setDraggingWatchStockId(stock.id)
+                      e.dataTransfer.effectAllowed = 'move'
+                    }}
+                    onDragOver={(e) => {
+                      if (stockListFilter !== '' || watchlistOnlyAlerts) return
+                      e.preventDefault()
+                      e.dataTransfer.dropEffect = 'move'
+                      if (draggingWatchStockId != null) {
+                        previewWatchlistReorder(draggingWatchStockId, stock.id)
+                      }
+                    }}
+                    onDrop={(e) => {
+                      if (stockListFilter !== '' || watchlistOnlyAlerts) return
+                      e.preventDefault()
+                      if (draggingWatchStockId != null) commitWatchlistReorder()
+                      setDraggingWatchStockId(null)
+                      watchDragSnapshotRef.current = null
+                    }}
+                    onDragEnd={() => {
+                      setDraggingWatchStockId(null)
+                      watchDragSnapshotRef.current = null
+                    }}
+                    className={`group rounded-xl border border-border/40 bg-background/30 hover:bg-accent/20 transition-colors p-3 cursor-pointer ${draggingWatchStockId === stock.id ? 'opacity-60' : ''}`}
+                    onClick={() => {
+                      if (isSuppressCardClick()) return
+                      setAgentDialogStock(stock)
+                    }}
+                  >
+                    <div className="flex items-start justify-between gap-3">
+                      <div className="min-w-0">
+                        <div className="flex items-center gap-2 min-w-0">
+                          <span className={`text-[9px] px-1 py-0.5 rounded ${marketBadge(stock.market).style}`}>
+                            {marketBadge(stock.market).label}
+                          </span>
+                          <button
+                            className="font-mono text-[12px] font-semibold text-foreground hover:text-primary"
+                            onClick={(e) => { e.stopPropagation(); openStockDetail(stock.symbol, stock.market, stock.name, false) }}
+                          >
+                            {stock.symbol}
+                          </button>
+                          <button
+                            className="text-[12px] text-muted-foreground truncate hover:text-primary"
+                            onClick={(e) => { e.stopPropagation(); openStockDetail(stock.symbol, stock.market, stock.name, false) }}
+                          >
+                            {stock.name}
+                          </button>
+                        </div>
+                      </div>
+                      <div className="text-right">
+                        <div className={`font-mono text-[14px] font-bold leading-tight ${changeColor}`}>
+                          {quote?.current_price != null ? quote.current_price.toFixed(2) : '--'}
+                        </div>
+                        <div className={`font-mono text-[11px] leading-tight ${changeColor}`}>
+                          {quote?.change_pct != null ? `${quote.change_pct >= 0 ? '+' : ''}${quote.change_pct.toFixed(2)}%` : '--'}
+                        </div>
+                      </div>
+                    </div>
+
+                    <div className="mt-2">
+                      {(suggestion || kline) ? (
+                        <SuggestionBadge
+                          suggestion={suggestion}
+                          stockName={stock.name}
+                          stockSymbol={stock.symbol}
+                          kline={kline}
+                          market={stock.market}
+                          hasPosition={false}
+                        />
+                      ) : (
+                        <div className="text-[11px] text-muted-foreground/70 py-2">暂无技术面/AI 分析</div>
+                      )}
+                    </div>
+
+                    <div className="mt-2 pt-2 border-t border-border/30 flex items-center justify-between gap-2">
+                      <div className="flex items-center gap-1 flex-wrap">
+                        {stock.agents && stock.agents.length > 0 ? (
+                          <Badge variant="secondary" className="text-[10px]">{stock.agents.length} Agent</Badge>
+                        ) : (
+                          <span className="text-[10px] text-muted-foreground/60">未配置 Agent</span>
+                        )}
+                        {runningAgents[stock.id] && (
+                          <span className="inline-flex items-center gap-1 text-[10px] text-amber-600">
+                            <span className="w-3 h-3 border-2 border-current/30 border-t-current rounded-full animate-spin" />
+                            {agents.find(a => a.name === runningAgents[stock.id])?.display_name || runningAgents[stock.id]}
+                          </span>
+                        )}
+                      </div>
+                      <div
+                        className="flex items-center gap-1 sm:opacity-0 sm:group-hover:opacity-100 transition-opacity"
+                        onClick={(e) => e.stopPropagation()}
+                      >
+                        <Button
+                          variant="ghost"
+                          size="icon"
+                          className="h-7 w-7"
+                          onClick={() => openKlineDialog(stock.symbol, stock.market, stock.name, false)}
+                          title="K线指标"
+                        >
+                          <BarChart3 className="w-3.5 h-3.5" />
+                        </Button>
+                        <StockPriceAlertPanel
+                          mode="icon"
+                          stockId={stock.id}
+                          symbol={stock.symbol}
+                          market={stock.market}
+                          stockName={stock.name}
+                          initialTotal={getPriceAlertSummary(stock.symbol, stock.market).total}
+                          initialEnabled={getPriceAlertSummary(stock.symbol, stock.market).enabled}
+                          onChanged={loadPriceAlertSummaries}
+                        />
+                        <Button
+                          variant="ghost"
+                          size="icon"
+                          className="h-7 w-7"
+                          onClick={() => openNewsDialog(stock.name)}
+                          title="相关资讯"
+                        >
+                          <Newspaper className="w-3.5 h-3.5" />
+                        </Button>
+                        <Button
+                          variant="ghost"
+                          size="icon"
+                          className="h-7 w-7"
+                          onClick={() => openStockDetail(stock.symbol, stock.market, stock.name, false)}
+                          title="详情"
+                        >
+                          <ExternalLink className="w-3.5 h-3.5" />
+                        </Button>
+                        <Button
+                          variant="ghost"
+                          size="icon"
+                          className="h-7 w-7 hover:text-destructive"
+                          onClick={() => setRemoveWatchStock(stock)}
+                          title="删除股票"
+                        >
+                          <X className="w-3.5 h-3.5" />
+                        </Button>
+                      </div>
+                    </div>
+                  </div>
+                )
+              })}
+            </div>
+          )}
+        </div>
+      )}
 
       {/* Kline Dialog */}
       <KlineSummaryDialog
@@ -1963,6 +2438,51 @@ export default function StocksPage() {
         hasPosition={klineDialogHasPosition}
         initialSummary={klineDialogInitialSummary as any}
       />
+
+      <StockInsightModal
+        open={insightOpen}
+        onOpenChange={setInsightOpen}
+        symbol={insightSymbol}
+        market={insightMarket}
+        stockName={insightName}
+        hasPosition={insightHasPosition}
+      />
+
+      {/* Remove Watchlist Dialog */}
+      <Dialog open={!!removeWatchStock} onOpenChange={(open) => { if (!open) setRemoveWatchStock(null) }}>
+        <DialogContent className="max-w-md">
+          <DialogHeader>
+            <DialogTitle>删除股票</DialogTitle>
+            <DialogDescription>删除后将从系统中移除该股票及其关注配置</DialogDescription>
+          </DialogHeader>
+          {removeWatchStock && (
+            <div className="space-y-4 mt-2">
+              <div className="rounded-lg border border-border/40 bg-accent/20 p-3">
+                <div className="text-[13px] font-semibold text-foreground">
+                  {removeWatchStock.name}
+                  <span className="ml-2 font-mono text-[12px] text-muted-foreground">{removeWatchStock.symbol}</span>
+                </div>
+                <div className="mt-1 text-[12px] text-muted-foreground">
+                  {hasAnyPositionForStockId(removeWatchStock.id)
+                    ? '该股票存在持仓，不能直接删除。请先在“持仓”Tab 删除持仓记录。'
+                    : '删除后将不再出现在关注列表，同时会清理该股票关联的价格提醒。'}
+                </div>
+              </div>
+
+              <div className="flex justify-end gap-2">
+                <Button variant="ghost" onClick={() => setRemoveWatchStock(null)} disabled={removingWatchStock}>取消</Button>
+                <Button
+                  variant="destructive"
+                  onClick={() => removeFromWatchlist(removeWatchStock)}
+                  disabled={removingWatchStock || hasAnyPositionForStockId(removeWatchStock.id)}
+                >
+                  {hasAnyPositionForStockId(removeWatchStock.id) ? '请先删除持仓' : (removingWatchStock ? '处理中…' : '删除股票')}
+                </Button>
+              </div>
+            </div>
+          )}
+        </DialogContent>
+      </Dialog>
 
       {/* Account Dialog */}
       <Dialog open={accountDialogOpen} onOpenChange={setAccountDialogOpen}>
@@ -2239,6 +2759,45 @@ export default function StocksPage() {
                           </Select>
                           <span className="text-[10px] text-muted-foreground">交易时段</span>
                         </div>
+
+                        {/* Schedule Preview */}
+                        {(() => {
+                          const eff = effectiveSchedule(agent, stockAgent)
+                          const isFollowingGlobal = !(stockAgent?.schedule || '').trim() && !!(agent.schedule || '').trim()
+                          const preview = eff ? schedulePreviewCache[eff] : null
+                          const isLoading = eff ? !!schedulePreviewLoading[eff] : false
+                          if (!eff) return null
+                          return (
+                            <div className="ml-[22px] rounded-lg border border-border/40 bg-background/30 px-2.5 py-2">
+                              <div className="flex items-center justify-between">
+                                <div className="text-[11px] text-muted-foreground">
+                                  未来触发时间预览{isFollowingGlobal ? <span className="ml-1 opacity-70">(跟随全局)</span> : null}
+                                </div>
+                                {isLoading && (
+                                  <span className="w-3 h-3 border-2 border-primary/30 border-t-primary rounded-full animate-spin" />
+                                )}
+                              </div>
+                              {'error' in (preview || {}) ? (
+                                <div className="mt-1 text-[11px] text-muted-foreground">{(preview as any).error}</div>
+                              ) : (preview as SchedulePreview | undefined)?.next_runs?.length ? (
+                                <div className="mt-1 flex flex-wrap items-center gap-1.5 text-[11px] text-muted-foreground">
+                                  {(preview as SchedulePreview).next_runs.map((t, i) => (
+                                    <span key={i} className="px-1.5 py-0.5 rounded border border-border/60 bg-accent/20 font-mono" title={t}>
+                                      {formatPreviewTime(t, (preview as SchedulePreview).timezone)}
+                                    </span>
+                                  ))}
+                                  {(preview as SchedulePreview).timezone ? (
+                                    <span className="opacity-60">({(preview as SchedulePreview).timezone})</span>
+                                  ) : null}
+                                </div>
+                              ) : (
+                                <div className="mt-1 text-[11px] text-muted-foreground">—</div>
+                              )}
+                              <div className="mt-1 text-[10px] text-muted-foreground/70 font-mono">schedule: {eff}</div>
+                            </div>
+                          )
+                        })()}
+
                         {/* AI Model Select */}
                         <div className="flex items-center gap-2">
                           <Cpu className="w-3.5 h-3.5 text-muted-foreground flex-shrink-0" />

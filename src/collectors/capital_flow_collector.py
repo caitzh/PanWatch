@@ -4,6 +4,7 @@ from dataclasses import dataclass
 
 import httpx
 
+from src.core.cn_symbol import is_cn_sh
 from src.models.market import MarketCode
 
 logger = logging.getLogger(__name__)
@@ -31,20 +32,12 @@ class CapitalFlow:
 
 
 def _get_eastmoney_secid(symbol: str, market: MarketCode) -> str:
-    """转换为东方财富的 secid 格式
-    
-    规则：
-    - 上交所：1.XXXXXX (6/9开头)
-    - 深交所：0.XXXXXX (0/1/2/3开头)
-    - 港股：116.XXXXX
-    - 美股：105.XXXXX
-    """
+    """转换为东方财富的 secid 格式"""
     if market == MarketCode.HK:
         return f"116.{symbol}"
     if market == MarketCode.US:
         return f"105.{symbol}"
-    # A股：5开头（ETF）、6开头（主板）、9开头（B股）→上交所(1)，其他→深交所(0)
-    prefix = "1" if symbol.startswith(("5", "6", "9")) else "0"
+    prefix = "1" if is_cn_sh(symbol) else "0"
     return f"{prefix}.{symbol}"
 
 
