@@ -452,28 +452,71 @@ class IntradayMonitorAgent(BaseAgent):
             lines.append("\n## 历史分析参考")
 
             if daily_analysis:
-                # 截取与当前股票相关的部分（最多 300 字）
-                content = (
-                    daily_analysis[:300] + "..."
-                    if len(daily_analysis) > 300
-                    else daily_analysis
+                # 提取当前股票相关的内容
+                stock_related = self._extract_stock_section(
+                    daily_analysis, stock.symbol, stock.name
                 )
-                lines.append(f"\n### 昨日盘后分析摘要")
-                lines.append(content)
+                if stock_related:
+                    lines.append(f"\n### 昨日盘后分析摘要")
+                    lines.append(stock_related)
 
             if premarket_analysis:
-                content = (
-                    premarket_analysis[:300] + "..."
-                    if len(premarket_analysis) > 300
-                    else premarket_analysis
+                stock_related = self._extract_stock_section(
+                    premarket_analysis, stock.symbol, stock.name
                 )
-                lines.append(f"\n### 今日盘前分析摘要")
-                lines.append(content)
+                if stock_related:
+                    lines.append(f"\n### 今日盘前分析摘要")
+                    lines.append(stock_related)
 
         lines.append("\n请结合技术分析、资金情况和历史分析，给出明确的操作建议。")
 
         user_content = "\n".join(lines)
         return system_prompt, user_content
+
+    def _extract_stock_section(
+        self, content: str, symbol: str, name: str, max_length: int = 300
+    ) -> str:
+        """
+        从全局分析中提取特定股票相关的内容
+
+        支持的格式：
+        - ### 股票名称（代码）
+        - ### 股票名称(代码)
+        - 「股票代码 股票名称」
+        """
+        if not content:
+            return ""
+
+        import re
+
+        # 方式1: 匹配 ### 股票名称（代码）格式
+        patterns = [
+            rf"###\s*{re.escape(name)}[（(]{symbol}[）)]",  # ### 股票名称（代码）
+            rf"###\s*{re.escape(name)}",  # ### 股票名称
+            rf"「{symbol}\s*{re.escape(name)}」",  # 「股票代码 股票名称」
+        ]
+
+        for pattern in patterns:
+            match = re.search(pattern, content)
+            if match:
+                # 从匹配位置开始，提取到下一个 ### 或 ## 或文档末尾
+                start = match.start()
+                rest = content[start:]
+
+                # 查找下一个章节标题
+                next_section = re.search(r"\n##", rest[1:])  # 跳过当前行的 #
+                if next_section:
+                    section = rest[: next_section.start() + 1]
+                else:
+                    section = rest
+
+                # 限制长度
+                if len(section) > max_length:
+                    section = section[:max_length] + "..."
+                return section.strip()
+
+        # 未找到特定股票内容，返回空（不返回全局内容）
+        return ""
 
     def _parse_suggestion(self, content: str) -> dict:
         """
