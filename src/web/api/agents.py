@@ -275,6 +275,13 @@ def update_agent(
     if not agent:
         raise HTTPException(404, f"Agent {agent_name} 不存在")
 
+    # 记录是否需要重载调度器
+    schedule_fields = {"enabled", "schedule", "execution_mode"}
+    need_reload = any(
+        key in schedule_fields and getattr(agent, key) != value
+        for key, value in update.model_dump(exclude_unset=True).items()
+    )
+
     for key, value in update.model_dump(exclude_unset=True).items():
         setattr(agent, key, value)
 
@@ -286,6 +293,15 @@ def update_agent(
 
     db.commit()
     db.refresh(agent)
+
+    # 如果修改了调度相关字段，重载调度器
+    if need_reload:
+        try:
+            from server import reload_scheduler
+            reload_scheduler()
+        except Exception as e:
+            logger.warning(f"重载调度器失败: {e}")
+
     return _agent_to_response(agent)
 
 
