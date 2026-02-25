@@ -294,13 +294,23 @@ def update_agent(
     db.commit()
     db.refresh(agent)
 
-    # 如果修改了调度相关字段，重载调度器
+    # 如果修改了调度相关字段，在新线程中重载调度器
     if need_reload:
-        try:
+        def _reload_in_thread():
+            import asyncio
             from server import reload_scheduler
-            reload_scheduler()
-        except Exception as e:
-            logger.warning(f"重载调度器失败: {e}")
+            try:
+                # 创建新的事件循环
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                reload_scheduler()
+            except Exception as e:
+                logger.warning(f"重载调度器失败: {e}")
+            finally:
+                loop.close()
+
+        thread = threading.Thread(target=_reload_in_thread, daemon=True)
+        thread.start()
 
     return _agent_to_response(agent)
 
