@@ -503,7 +503,7 @@ export default function DashboardPage() {
 
   // 从建议池加载监控数据（快速显示）
   const loadMonitorFromPool = useCallback(async () => {
-    const watchlistStocks = stocks.filter(s => s.enabled)
+    const watchlistStocks = stocks
     if (watchlistStocks.length === 0) return
 
     setScanning(true)
@@ -695,7 +695,6 @@ export default function DashboardPage() {
       setBoardStocks([])
     }
   }
->>>>>>> upstream/main
 
   const scanAlerts = useCallback(async () => {
     if (!hasWatchlist) return
