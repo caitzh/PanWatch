@@ -2,12 +2,19 @@
 
 from __future__ import annotations
 
+import asyncio
+from datetime import datetime, timedelta
 import logging
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 from src.core.context_store import cleanup_context_data
+from src.core.entry_candidates import evaluate_entry_candidate_outcomes
 from src.core.prediction_outcome import evaluate_pending_prediction_outcomes
+from src.core.strategy_engine import (
+    evaluate_strategy_outcomes,
+    rebalance_strategy_weights,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -33,7 +40,7 @@ class ContextMaintenanceScheduler:
             return
         self._evaluating = True
         try:
-            stats = evaluate_pending_prediction_outcomes()
+            stats = await asyncio.to_thread(evaluate_pending_prediction_outcomes)
             logger.info(
                 "[上下文维护] 后验评估完成: pending=%s eligible=%s evaluated=%s skipped_not_due=%s skipped_no_price=%s",
                 stats.get("total_pending", 0),
@@ -41,6 +48,47 @@ class ContextMaintenanceScheduler:
                 stats.get("evaluated", 0),
                 stats.get("skipped_not_due", 0),
                 stats.get("skipped_no_price", 0),
+            )
+            cand_stats = await asyncio.to_thread(
+                evaluate_entry_candidate_outcomes,
+                horizons=(1, 3, 5, 10),
+                snapshot_days=45,
+                limit=500,
+            )
+            logger.info(
+                "[上下文维护] 候选后验评估完成: total=%s eligible=%s evaluated=%s skipped_not_due=%s skipped_no_price=%s",
+                cand_stats.get("total_candidates", 0),
+                cand_stats.get("eligible", 0),
+                cand_stats.get("evaluated", 0),
+                cand_stats.get("skipped_not_due", 0),
+                cand_stats.get("skipped_no_price", 0),
+            )
+            strategy_stats = await asyncio.to_thread(
+                evaluate_strategy_outcomes,
+                horizons=(1, 3, 5, 10),
+                snapshot_days=60,
+                limit=1200,
+            )
+            logger.info(
+                "[上下文维护] 策略后验评估完成: total=%s eligible=%s evaluated=%s skipped_not_due=%s skipped_no_price=%s",
+                strategy_stats.get("total_signals", 0),
+                strategy_stats.get("eligible", 0),
+                strategy_stats.get("evaluated", 0),
+                strategy_stats.get("skipped_not_due", 0),
+                strategy_stats.get("skipped_no_price", 0),
+            )
+            rebalance = await asyncio.to_thread(
+                rebalance_strategy_weights,
+                window_days=45,
+                min_samples=8,
+                alpha=0.35,
+                regime="default",
+            )
+            logger.info(
+                "[上下文维护] 策略调权完成: changed=%s checked=%s skipped_low_sample=%s",
+                rebalance.get("changed", 0),
+                rebalance.get("checked", 0),
+                rebalance.get("skipped_low_sample", 0),
             )
         except Exception as e:
             logger.exception(f"[上下文维护] 后验评估异常: {e}")
@@ -53,7 +101,8 @@ class ContextMaintenanceScheduler:
             return
         self._cleaning = True
         try:
-            deleted = cleanup_context_data(
+            deleted = await asyncio.to_thread(
+                cleanup_context_data,
                 snapshot_days=self.snapshot_retention_days,
                 topic_days=self.snapshot_retention_days,
                 context_run_days=self.snapshot_retention_days,
@@ -66,10 +115,42 @@ class ContextMaintenanceScheduler:
             self._cleaning = False
 
     async def evaluate_once(self) -> dict:
-        return evaluate_pending_prediction_outcomes()
+        agent_task = asyncio.to_thread(evaluate_pending_prediction_outcomes)
+        candidate_task = asyncio.to_thread(
+            evaluate_entry_candidate_outcomes,
+            horizons=(1, 3, 5, 10),
+            snapshot_days=45,
+            limit=500,
+        )
+        strategy_eval_task = asyncio.to_thread(
+            evaluate_strategy_outcomes,
+            horizons=(1, 3, 5, 10),
+            snapshot_days=60,
+            limit=1200,
+        )
+        strategy_rebalance_task = asyncio.to_thread(
+            rebalance_strategy_weights,
+            window_days=45,
+            min_samples=8,
+            alpha=0.35,
+            regime="default",
+        )
+        agent_stats, candidate_stats, strategy_eval_stats, strategy_rebalance_stats = await asyncio.gather(
+            agent_task,
+            candidate_task,
+            strategy_eval_task,
+            strategy_rebalance_task,
+        )
+        return {
+            "agent_predictions": agent_stats,
+            "entry_candidates": candidate_stats,
+            "strategy_outcomes": strategy_eval_stats,
+            "strategy_rebalance": strategy_rebalance_stats,
+        }
 
     async def cleanup_once(self) -> dict:
-        return cleanup_context_data(
+        return await asyncio.to_thread(
+            cleanup_context_data,
             snapshot_days=self.snapshot_retention_days,
             topic_days=self.snapshot_retention_days,
             context_run_days=self.snapshot_retention_days,
@@ -96,9 +177,19 @@ class ContextMaintenanceScheduler:
             coalesce=True,
             max_instances=1,
         )
+        # Run a bootstrap evaluation shortly after startup to warm up outcome stats.
+        self.scheduler.add_job(
+            self._evaluate_job,
+            "date",
+            run_date=datetime.now(self.scheduler.timezone) + timedelta(seconds=15),
+            id="context_maintenance_bootstrap_evaluate",
+            replace_existing=True,
+            coalesce=True,
+            max_instances=1,
+        )
         self.scheduler.start()
         logger.info(
-            "上下文维护调度器已启动（后验评估间隔 %sh，快照保留 %s 天，后验保留 %s 天）",
+            "上下文维护调度器已启动（后验评估间隔 %sh，启动补跑 +15s，快照保留 %s 天，后验保留 %s 天）",
             self.eval_interval_hours,
             self.snapshot_retention_days,
             self.outcome_retention_days,

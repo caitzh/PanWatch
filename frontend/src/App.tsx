@@ -1,9 +1,10 @@
 import { useState, useEffect, useRef } from 'react'
 import { Routes, Route, NavLink, useLocation, Navigate } from 'react-router-dom'
-import { Moon, Sun, TrendingUp, Bot, ScrollText, Settings, List, Database, Clock, LayoutDashboard, LogOut, Github, BellRing, MoreHorizontal } from 'lucide-react'
+import { Moon, Sun, TrendingUp, Bot, ScrollText, Settings, List, Database, Clock, LayoutDashboard, LogOut, Github, BellRing, MoreHorizontal, Sparkles } from 'lucide-react'
 import { useTheme } from '@/hooks/use-theme'
 import { appApi, fetchAPI, isAuthenticated, logout } from '@panwatch/api'
 import DashboardPage from '@/pages/Dashboard'
+import OpportunitiesPage from '@/pages/Opportunities'
 import StocksPage from '@/pages/Stocks'
 import AgentsPage from '@/pages/Agents'
 import SettingsPage from '@/pages/Settings'
@@ -17,18 +18,19 @@ import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } f
 import { Button } from '@panwatch/base-ui/components/ui/button'
 
 const navItems = [
-  { to: '/', icon: LayoutDashboard, label: 'Dashboard' },
+  { to: '/', icon: LayoutDashboard, label: '首页' },
   { to: '/portfolio', icon: List, label: '持仓' },
+  { to: '/opportunities', icon: Sparkles, label: '机会' },
+  { to: '/alerts', icon: BellRing, label: '提醒' },
   { to: '/agents', icon: Bot, label: 'Agent' },
   { to: '/history', icon: Clock, label: '历史' },
-  { to: '/alerts', icon: BellRing, label: '提醒' },
   { to: '/datasources', icon: Database, label: '数据源' },
   { to: '/settings', icon: Settings, label: '设置' },
 ]
-const desktopPrimaryNavItems = [navItems[0], navItems[1], navItems[2], navItems[4]]
-const desktopMoreNavItems = [navItems[3], navItems[5], navItems[6]]
-const mobilePrimaryNavItems = [navItems[0], navItems[1], navItems[2], navItems[4]]
-const mobileMoreNavItems = [navItems[3], navItems[5], navItems[6]]
+const desktopPrimaryNavItems = [navItems[0], navItems[1], navItems[2], navItems[3]]
+const desktopMoreNavItems = [navItems[4], navItems[5], navItems[6], navItems[7]]
+const mobilePrimaryNavItems = [navItems[0], navItems[1], navItems[2], navItems[3]]
+const mobileMoreNavItems = [navItems[4], navItems[5], navItems[6], navItems[7]]
 
 // 认证守卫组件
 function RequireAuth({ children }: { children: React.ReactNode }) {
@@ -344,6 +346,7 @@ function App() {
       <main className="px-4 md:px-6 py-4 md:py-6 w-full">
         <Routes>
           <Route path="/" element={<DashboardPage />} />
+          <Route path="/opportunities" element={<OpportunitiesPage />} />
           <Route path="/portfolio" element={<StocksPage />} />
           <Route path="/agents" element={<AgentsPage />} />
           <Route path="/history" element={<HistoryPage />} />

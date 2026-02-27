@@ -32,6 +32,7 @@ from src.core.agent_catalog import (
     AGENT_SEED_SPECS,
     AGENT_KIND_WORKFLOW,
 )
+from src.core.strategy_catalog import ensure_strategy_catalog
 from src.agents.base import AgentContext, PortfolioInfo, AccountInfo, PositionInfo
 from src.agents.daily_report import DailyReportAgent
 from src.agents.news_digest import NewsDigestAgent
@@ -395,7 +396,12 @@ def seed_data_sources():
 
     db.commit()
     db.close()
-    logger.info("预置数据源初始化完成")
+
+
+def seed_strategies():
+    """初始化策略目录。"""
+    ensure_strategy_catalog()
+    logger.info("策略目录初始化完成")
 
 
 def load_watchlist_for_agent(agent_name: str) -> list[StockConfig]:
@@ -1095,6 +1101,7 @@ async def lifespan(app):
 
     seed_agents()
     seed_data_sources()
+    seed_strategies()
     seed_sample_stocks()
 
     # 后台刷新股票列表缓存

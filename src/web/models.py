@@ -415,6 +415,7 @@ class StockSuggestion(Base):
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     stock_symbol = Column(String, nullable=False, index=True)
+    stock_market = Column(String, nullable=False, default="CN", index=True)
     stock_name = Column(String, default="")
 
     # 建议内容
@@ -444,8 +445,402 @@ class StockSuggestion(Base):
     created_at = Column(DateTime, server_default=func.now())
     expires_at = Column(DateTime, nullable=True)  # 建议过期时间
 
-    # 索引：按股票+时间快速查询
-    __table_args__ = (Index("ix_suggestion_symbol_time", "stock_symbol", "created_at"),)
+    # 索引：按市场+股票+时间快速查询
+    __table_args__ = (
+        Index(
+            "ix_suggestion_market_symbol_time",
+            "stock_market",
+            "stock_symbol",
+            "created_at",
+        ),
+        Index("ix_suggestion_market_expires", "stock_market", "expires_at"),
+    )
+
+
+class EntryCandidate(Base):
+    """入场候选榜快照（按天去重，可追溯来源建议与证据）。"""
+
+    __tablename__ = "entry_candidates"
+    __table_args__ = (
+        UniqueConstraint(
+            "stock_symbol",
+            "stock_market",
+            "snapshot_date",
+            name="uq_entry_candidate_stock_date",
+        ),
+        Index("ix_entry_candidate_score_date", "snapshot_date", "score"),
+        Index("ix_entry_candidate_status_updated", "status", "updated_at"),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    stock_symbol = Column(String, nullable=False)
+    stock_market = Column(String, nullable=False, default="CN")
+    stock_name = Column(String, default="")
+    snapshot_date = Column(String, nullable=False)  # YYYY-MM-DD
+    status = Column(String, default="active")  # active / inactive / invalidated
+    score = Column(Float, nullable=False, default=0)
+    confidence = Column(Float, nullable=True)
+    action = Column(String, nullable=False, default="watch")
+    action_label = Column(String, nullable=False, default="观望")
+    signal = Column(String, default="")
+    reason = Column(String, default="")
+    candidate_source = Column(String, nullable=False, default="watchlist")  # watchlist / market_scan
+    strategy_tags = Column(JSON, default=[])
+    is_holding_snapshot = Column(Boolean, default=False)
+    plan_quality = Column(Integer, default=0)  # 0-100
+    entry_low = Column(Float, nullable=True)
+    entry_high = Column(Float, nullable=True)
+    stop_loss = Column(Float, nullable=True)
+    target_price = Column(Float, nullable=True)
+    invalidation = Column(String, default="")
+    source_agent = Column(String, default="")
+    source_suggestion_id = Column(Integer, nullable=True)
+    source_trace_id = Column(String, default="")
+    evidence = Column(JSON, default=[])
+    plan = Column(JSON, default={})
+    meta = Column(JSON, default={})
+    created_at = Column(DateTime, server_default=func.now())
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
+
+
+class MarketScanSnapshot(Base):
+    """市场池候选快照（用于多源回退与覆盖诊断）。"""
+
+    __tablename__ = "market_scan_snapshots"
+    __table_args__ = (
+        UniqueConstraint(
+            "snapshot_date",
+            "stock_symbol",
+            "stock_market",
+            name="uq_market_scan_snapshot_symbol",
+        ),
+        Index("ix_market_scan_snapshot_day_market", "snapshot_date", "stock_market"),
+        Index("ix_market_scan_snapshot_source", "snapshot_date", "source"),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    snapshot_date = Column(String, nullable=False)  # YYYY-MM-DD
+    stock_symbol = Column(String, nullable=False)
+    stock_market = Column(String, nullable=False, default="CN")
+    stock_name = Column(String, default="")
+    source = Column(String, nullable=False, default="market_scan")
+    score_seed = Column(Float, nullable=False, default=0.0)
+    quote = Column(JSON, default={})
+    meta = Column(JSON, default={})
+    created_at = Column(DateTime, server_default=func.now())
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
+
+
+class EntryCandidateFeedback(Base):
+    """入场候选反馈（用于策略迭代与质量评估）。"""
+
+    __tablename__ = "entry_candidate_feedback"
+    __table_args__ = (
+        Index("ix_entry_feedback_time", "created_at"),
+        Index("ix_entry_feedback_symbol_day", "stock_market", "stock_symbol", "snapshot_date"),
+        Index("ix_entry_feedback_source", "candidate_source"),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    snapshot_date = Column(String, nullable=False, default="")  # YYYY-MM-DD
+    stock_symbol = Column(String, nullable=False)
+    stock_market = Column(String, nullable=False, default="CN")
+    candidate_source = Column(String, nullable=False, default="watchlist")
+    strategy_tags = Column(JSON, default=[])
+    useful = Column(Boolean, default=True)
+    reason = Column(String, default="")
+    created_at = Column(DateTime, server_default=func.now(), index=True)
+
+
+class EntryCandidateOutcome(Base):
+    """入场候选后验结果（自动评估）。"""
+
+    __tablename__ = "entry_candidate_outcomes"
+    __table_args__ = (
+        UniqueConstraint(
+            "candidate_id",
+            "horizon_days",
+            name="uq_entry_outcome_candidate_horizon",
+        ),
+        Index("ix_entry_outcome_status_horizon", "outcome_status", "horizon_days"),
+        Index("ix_entry_outcome_symbol_day", "stock_market", "stock_symbol", "snapshot_date"),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    candidate_id = Column(Integer, ForeignKey("entry_candidates.id", ondelete="CASCADE"), nullable=False)
+    snapshot_date = Column(String, nullable=False, default="")
+    stock_symbol = Column(String, nullable=False)
+    stock_market = Column(String, nullable=False, default="CN")
+    candidate_source = Column(String, nullable=False, default="watchlist")
+    strategy_tags = Column(JSON, default=[])
+    horizon_days = Column(Integer, nullable=False, default=1)
+    target_date = Column(String, nullable=False, default="")  # YYYY-MM-DD
+    base_price = Column(Float, nullable=True)
+    outcome_price = Column(Float, nullable=True)
+    outcome_return_pct = Column(Float, nullable=True)
+    hit_target = Column(Boolean, nullable=True)
+    hit_stop = Column(Boolean, nullable=True)
+    outcome_status = Column(String, nullable=False, default="pending")
+    meta = Column(JSON, default={})
+    evaluated_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, server_default=func.now())
+
+
+class StrategyCatalog(Base):
+    """策略目录（可版本化、可启停、可调权重）。"""
+
+    __tablename__ = "strategy_catalog"
+    __table_args__ = (
+        UniqueConstraint("code", name="uq_strategy_catalog_code"),
+        Index("ix_strategy_catalog_enabled", "enabled"),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    code = Column(String, nullable=False)
+    name = Column(String, nullable=False)
+    description = Column(String, default="")
+    version = Column(String, nullable=False, default="v1")
+    enabled = Column(Boolean, default=True)
+    market_scope = Column(String, default="ALL")  # ALL/CN/HK/US
+    risk_level = Column(String, default="medium")  # low/medium/high
+    params = Column(JSON, default={})
+    default_weight = Column(Float, nullable=False, default=1.0)
+    created_at = Column(DateTime, server_default=func.now())
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
+
+
+class StrategySignalRun(Base):
+    """策略信号执行快照（按日/股票/策略去重）。"""
+
+    __tablename__ = "strategy_signal_runs"
+    __table_args__ = (
+        UniqueConstraint(
+            "snapshot_date",
+            "stock_symbol",
+            "stock_market",
+            "strategy_code",
+            "source_candidate_id",
+            name="uq_strategy_signal_daily_unique",
+        ),
+        Index("ix_strategy_signal_snapshot_rank", "snapshot_date", "rank_score"),
+        Index("ix_strategy_signal_strategy_market", "strategy_code", "stock_market"),
+        Index("ix_strategy_signal_status", "status", "updated_at"),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    snapshot_date = Column(String, nullable=False)  # YYYY-MM-DD
+    stock_symbol = Column(String, nullable=False)
+    stock_market = Column(String, nullable=False, default="CN")
+    stock_name = Column(String, default="")
+
+    strategy_code = Column(String, nullable=False)
+    strategy_name = Column(String, default="")
+    strategy_version = Column(String, default="v1")
+    risk_level = Column(String, default="medium")
+    source_pool = Column(String, default="watchlist")  # watchlist/market_scan
+
+    score = Column(Float, nullable=False, default=0)
+    rank_score = Column(Float, nullable=False, default=0)
+    confidence = Column(Float, nullable=True)
+    status = Column(String, default="active")  # active/inactive/invalidated
+    action = Column(String, default="watch")
+    action_label = Column(String, default="观望")
+    signal = Column(String, default="")
+    reason = Column(String, default="")
+    evidence = Column(JSON, default=[])
+    holding_days = Column(Integer, default=3)
+
+    entry_low = Column(Float, nullable=True)
+    entry_high = Column(Float, nullable=True)
+    stop_loss = Column(Float, nullable=True)
+    target_price = Column(Float, nullable=True)
+    invalidation = Column(String, default="")
+    plan_quality = Column(Integer, default=0)
+
+    source_agent = Column(String, default="")
+    source_suggestion_id = Column(Integer, nullable=True)
+    source_candidate_id = Column(Integer, nullable=True)
+    trace_id = Column(String, default="")
+    is_holding_snapshot = Column(Boolean, default=False)
+    context_quality_score = Column(Float, nullable=True)
+    payload = Column(JSON, default={})
+    created_at = Column(DateTime, server_default=func.now())
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
+
+
+class StrategyOutcome(Base):
+    """策略后验结果。"""
+
+    __tablename__ = "strategy_outcomes"
+    __table_args__ = (
+        UniqueConstraint(
+            "signal_run_id",
+            "horizon_days",
+            name="uq_strategy_outcome_signal_horizon",
+        ),
+        Index("ix_strategy_outcome_strategy_horizon", "strategy_code", "horizon_days"),
+        Index("ix_strategy_outcome_market_date", "stock_market", "target_date"),
+        Index("ix_strategy_outcome_status", "outcome_status", "evaluated_at"),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    signal_run_id = Column(
+        Integer, ForeignKey("strategy_signal_runs.id", ondelete="CASCADE"), nullable=False
+    )
+    strategy_code = Column(String, nullable=False)
+    snapshot_date = Column(String, nullable=False, default="")
+    stock_symbol = Column(String, nullable=False)
+    stock_market = Column(String, nullable=False, default="CN")
+    source_pool = Column(String, default="watchlist")
+    horizon_days = Column(Integer, nullable=False, default=1)
+    target_date = Column(String, nullable=False, default="")  # YYYY-MM-DD
+    base_price = Column(Float, nullable=True)
+    outcome_price = Column(Float, nullable=True)
+    outcome_return_pct = Column(Float, nullable=True)
+    hit_target = Column(Boolean, nullable=True)
+    hit_stop = Column(Boolean, nullable=True)
+    outcome_status = Column(String, nullable=False, default="pending")
+    meta = Column(JSON, default={})
+    evaluated_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, server_default=func.now())
+
+
+class StrategyWeight(Base):
+    """策略权重（当前生效值）。"""
+
+    __tablename__ = "strategy_weights"
+    __table_args__ = (
+        UniqueConstraint(
+            "strategy_code",
+            "market",
+            "regime",
+            name="uq_strategy_weight_key",
+        ),
+        Index("ix_strategy_weight_effective", "effective_from"),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    strategy_code = Column(String, nullable=False)
+    market = Column(String, nullable=False, default="ALL")
+    regime = Column(String, nullable=False, default="default")
+    weight = Column(Float, nullable=False, default=1.0)
+    reason = Column(String, default="")
+    meta = Column(JSON, default={})
+    effective_from = Column(DateTime, server_default=func.now())
+    created_at = Column(DateTime, server_default=func.now())
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
+
+
+class StrategyWeightHistory(Base):
+    """策略调权历史。"""
+
+    __tablename__ = "strategy_weight_history"
+    __table_args__ = (
+        Index("ix_strategy_weight_history_time", "created_at"),
+        Index("ix_strategy_weight_history_strategy_market", "strategy_code", "market"),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    strategy_code = Column(String, nullable=False)
+    market = Column(String, nullable=False, default="ALL")
+    regime = Column(String, nullable=False, default="default")
+    old_weight = Column(Float, nullable=False, default=1.0)
+    new_weight = Column(Float, nullable=False, default=1.0)
+    reason = Column(String, default="")
+    window_days = Column(Integer, default=45)
+    sample_size = Column(Integer, default=0)
+    meta = Column(JSON, default={})
+    created_at = Column(DateTime, server_default=func.now())
+
+
+class MarketRegimeSnapshot(Base):
+    """市场状态快照（用于按市场动态调权与解释）。"""
+
+    __tablename__ = "market_regime_snapshots"
+    __table_args__ = (
+        UniqueConstraint(
+            "snapshot_date",
+            "market",
+            name="uq_market_regime_day_market",
+        ),
+        Index("ix_market_regime_snapshot", "snapshot_date", "market"),
+        Index("ix_market_regime_type", "regime"),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    snapshot_date = Column(String, nullable=False)  # YYYY-MM-DD
+    market = Column(String, nullable=False, default="CN")  # CN/HK/US
+    regime = Column(String, nullable=False, default="neutral")  # bullish/neutral/bearish
+    regime_score = Column(Float, nullable=False, default=0.0)  # [-1, 1]
+    confidence = Column(Float, nullable=False, default=0.0)  # [0, 1]
+    breadth_up_pct = Column(Float, nullable=True)
+    avg_change_pct = Column(Float, nullable=True)
+    volatility_pct = Column(Float, nullable=True)
+    active_ratio = Column(Float, nullable=True)
+    sample_size = Column(Integer, default=0)
+    meta = Column(JSON, default={})
+    created_at = Column(DateTime, server_default=func.now())
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
+
+
+class StrategyFactorSnapshot(Base):
+    """每条策略信号的因子分解快照。"""
+
+    __tablename__ = "strategy_factor_snapshots"
+    __table_args__ = (
+        UniqueConstraint("signal_run_id", name="uq_strategy_factor_signal"),
+        Index("ix_strategy_factor_snapshot_score", "snapshot_date", "final_score"),
+        Index("ix_strategy_factor_strategy_market", "strategy_code", "stock_market"),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    signal_run_id = Column(
+        Integer, ForeignKey("strategy_signal_runs.id", ondelete="CASCADE"), nullable=False
+    )
+    snapshot_date = Column(String, nullable=False)  # YYYY-MM-DD
+    stock_symbol = Column(String, nullable=False)
+    stock_market = Column(String, nullable=False, default="CN")
+    strategy_code = Column(String, nullable=False)
+    alpha_score = Column(Float, default=0.0)
+    catalyst_score = Column(Float, default=0.0)
+    quality_score = Column(Float, default=0.0)
+    risk_penalty = Column(Float, default=0.0)
+    crowd_penalty = Column(Float, default=0.0)
+    source_bonus = Column(Float, default=0.0)
+    regime_multiplier = Column(Float, default=1.0)
+    final_score = Column(Float, nullable=False, default=0.0)
+    factor_payload = Column(JSON, default={})
+    created_at = Column(DateTime, server_default=func.now())
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
+
+
+class PortfolioRiskSnapshot(Base):
+    """按快照/市场聚合的组合风险画像。"""
+
+    __tablename__ = "portfolio_risk_snapshots"
+    __table_args__ = (
+        UniqueConstraint(
+            "snapshot_date",
+            "market",
+            name="uq_portfolio_risk_day_market",
+        ),
+        Index("ix_portfolio_risk_snapshot", "snapshot_date", "market"),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    snapshot_date = Column(String, nullable=False)  # YYYY-MM-DD
+    market = Column(String, nullable=False, default="CN")
+    total_signals = Column(Integer, default=0)
+    active_signals = Column(Integer, default=0)
+    held_signals = Column(Integer, default=0)
+    unheld_signals = Column(Integer, default=0)
+    high_risk_ratio = Column(Float, nullable=True)
+    concentration_top5 = Column(Float, nullable=True)
+    avg_rank_score = Column(Float, nullable=True)
+    risk_level = Column(String, default="medium")  # low/medium/high
+    meta = Column(JSON, default={})
+    created_at = Column(DateTime, server_default=func.now())
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
 
 
 class SuggestionFeedback(Base):

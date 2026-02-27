@@ -5,7 +5,9 @@ from __future__ import annotations
 import hashlib
 import inspect
 import logging
+import json
 from dataclasses import dataclass
+from datetime import date
 from typing import Callable
 
 from sqlalchemy import text
@@ -357,6 +359,1041 @@ def _m106_log_observability(conn: Connection) -> None:
         )
 
 
+def _m107_suggestion_market_dimension(conn: Connection) -> None:
+    _add_column_if_missing(
+        conn,
+        "stock_suggestions",
+        "stock_market",
+        "ALTER TABLE stock_suggestions ADD COLUMN stock_market TEXT DEFAULT 'CN'",
+    )
+
+    if not _has_table(conn, "stock_suggestions"):
+        return
+
+    # 历史数据平滑回填：优先从 stocks 里推断 market，否则回退 CN。
+    conn.execute(
+        text(
+            """
+UPDATE stock_suggestions
+SET stock_market = COALESCE(
+    (
+      SELECT s.market
+      FROM stocks s
+      WHERE s.symbol = stock_suggestions.stock_symbol
+      ORDER BY CASE WHEN s.market='CN' THEN 0 ELSE 1 END, s.id ASC
+      LIMIT 1
+    ),
+    'CN'
+)
+WHERE stock_market IS NULL OR TRIM(stock_market) = ''
+"""
+        )
+    )
+    _create_index_if_missing(
+        conn,
+        "ix_suggestion_market_symbol_time",
+        "CREATE INDEX ix_suggestion_market_symbol_time ON stock_suggestions(stock_market, stock_symbol, created_at)",
+    )
+    _create_index_if_missing(
+        conn,
+        "ix_suggestion_market_expires",
+        "CREATE INDEX ix_suggestion_market_expires ON stock_suggestions(stock_market, expires_at)",
+    )
+
+
+def _m108_entry_candidates_table(conn: Connection) -> None:
+    conn.execute(
+        text(
+            """
+CREATE TABLE IF NOT EXISTS entry_candidates (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  stock_symbol TEXT NOT NULL,
+  stock_market TEXT NOT NULL DEFAULT 'CN',
+  stock_name TEXT DEFAULT '',
+  snapshot_date TEXT NOT NULL,
+  status TEXT DEFAULT 'active',
+  score REAL NOT NULL DEFAULT 0,
+  confidence REAL,
+  action TEXT NOT NULL DEFAULT 'watch',
+  action_label TEXT NOT NULL DEFAULT '观望',
+  signal TEXT DEFAULT '',
+  reason TEXT DEFAULT '',
+  entry_low REAL,
+  entry_high REAL,
+  stop_loss REAL,
+  target_price REAL,
+  invalidation TEXT DEFAULT '',
+  source_agent TEXT DEFAULT '',
+  source_suggestion_id INTEGER,
+  source_trace_id TEXT DEFAULT '',
+  evidence TEXT DEFAULT '[]',
+  plan TEXT DEFAULT '{}',
+  meta TEXT DEFAULT '{}',
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+  updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+  CONSTRAINT uq_entry_candidate_stock_date UNIQUE(stock_symbol, stock_market, snapshot_date)
+)
+"""
+        )
+    )
+    _create_index_if_missing(
+        conn,
+        "ix_entry_candidate_score_date",
+        "CREATE INDEX ix_entry_candidate_score_date ON entry_candidates(snapshot_date, score)",
+    )
+    _create_index_if_missing(
+        conn,
+        "ix_entry_candidate_status_updated",
+        "CREATE INDEX ix_entry_candidate_status_updated ON entry_candidates(status, updated_at)",
+    )
+
+    # 历史平滑迁移：将每个市场/股票最新建议回填为“今日候选”基线记录。
+    today = date.today().strftime("%Y-%m-%d")
+    conn.execute(
+        text(
+            """
+INSERT OR IGNORE INTO entry_candidates (
+  stock_symbol, stock_market, stock_name, snapshot_date,
+  status, score, action, action_label, signal, reason,
+  source_agent, source_suggestion_id, evidence, plan, meta
+)
+SELECT
+  s.stock_symbol,
+  COALESCE(NULLIF(TRIM(s.stock_market), ''), 'CN') AS stock_market,
+  COALESCE(s.stock_name, ''),
+  :today AS snapshot_date,
+  CASE
+    WHEN s.action IN ('buy', 'add', 'hold', 'watch') THEN 'active'
+    ELSE 'inactive'
+  END AS status,
+  CASE
+    WHEN s.action = 'buy' THEN 78
+    WHEN s.action = 'add' THEN 72
+    WHEN s.action = 'hold' THEN 58
+    WHEN s.action = 'watch' THEN 50
+    ELSE 30
+  END AS score,
+  COALESCE(s.action, 'watch'),
+  COALESCE(s.action_label, '观望'),
+  COALESCE(s.signal, ''),
+  COALESCE(s.reason, ''),
+  COALESCE(s.agent_name, ''),
+  s.id,
+  '[]',
+  '{}',
+  COALESCE(s.meta, '{}')
+FROM stock_suggestions s
+JOIN (
+  SELECT stock_symbol, COALESCE(NULLIF(TRIM(stock_market), ''), 'CN') AS stock_market, MAX(id) AS max_id
+  FROM stock_suggestions
+  GROUP BY stock_symbol, COALESCE(NULLIF(TRIM(stock_market), ''), 'CN')
+) latest
+ON latest.max_id = s.id
+"""
+        ),
+        {"today": today},
+    )
+
+
+def _m109_entry_candidate_upgrade(conn: Connection) -> None:
+    _add_column_if_missing(
+        conn,
+        "entry_candidates",
+        "candidate_source",
+        "ALTER TABLE entry_candidates ADD COLUMN candidate_source TEXT DEFAULT 'watchlist'",
+    )
+    _add_column_if_missing(
+        conn,
+        "entry_candidates",
+        "strategy_tags",
+        "ALTER TABLE entry_candidates ADD COLUMN strategy_tags TEXT DEFAULT '[]'",
+    )
+    _add_column_if_missing(
+        conn,
+        "entry_candidates",
+        "is_holding_snapshot",
+        "ALTER TABLE entry_candidates ADD COLUMN is_holding_snapshot INTEGER DEFAULT 0",
+    )
+    _add_column_if_missing(
+        conn,
+        "entry_candidates",
+        "plan_quality",
+        "ALTER TABLE entry_candidates ADD COLUMN plan_quality INTEGER DEFAULT 0",
+    )
+    _create_index_if_missing(
+        conn,
+        "ix_entry_candidate_source_score",
+        "CREATE INDEX ix_entry_candidate_source_score ON entry_candidates(candidate_source, score)",
+    )
+    _create_index_if_missing(
+        conn,
+        "ix_entry_candidate_market_status",
+        "CREATE INDEX ix_entry_candidate_market_status ON entry_candidates(stock_market, status)",
+    )
+
+    conn.execute(
+        text(
+            """
+CREATE TABLE IF NOT EXISTS entry_candidate_feedback (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  snapshot_date TEXT DEFAULT '',
+  stock_symbol TEXT NOT NULL,
+  stock_market TEXT NOT NULL DEFAULT 'CN',
+  candidate_source TEXT NOT NULL DEFAULT 'watchlist',
+  strategy_tags TEXT DEFAULT '[]',
+  useful INTEGER DEFAULT 1,
+  reason TEXT DEFAULT '',
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+)
+"""
+        )
+    )
+    _create_index_if_missing(
+        conn,
+        "ix_entry_feedback_time",
+        "CREATE INDEX ix_entry_feedback_time ON entry_candidate_feedback(created_at)",
+    )
+    _create_index_if_missing(
+        conn,
+        "ix_entry_feedback_symbol_day",
+        "CREATE INDEX ix_entry_feedback_symbol_day ON entry_candidate_feedback(stock_market, stock_symbol, snapshot_date)",
+    )
+    _create_index_if_missing(
+        conn,
+        "ix_entry_feedback_source",
+        "CREATE INDEX ix_entry_feedback_source ON entry_candidate_feedback(candidate_source)",
+    )
+
+
+def _m110_entry_candidate_outcomes(conn: Connection) -> None:
+    conn.execute(
+        text(
+            """
+CREATE TABLE IF NOT EXISTS entry_candidate_outcomes (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  candidate_id INTEGER NOT NULL REFERENCES entry_candidates(id) ON DELETE CASCADE,
+  snapshot_date TEXT DEFAULT '',
+  stock_symbol TEXT NOT NULL,
+  stock_market TEXT NOT NULL DEFAULT 'CN',
+  candidate_source TEXT NOT NULL DEFAULT 'watchlist',
+  strategy_tags TEXT DEFAULT '[]',
+  horizon_days INTEGER NOT NULL DEFAULT 1,
+  target_date TEXT DEFAULT '',
+  base_price REAL,
+  outcome_price REAL,
+  outcome_return_pct REAL,
+  hit_target INTEGER,
+  hit_stop INTEGER,
+  outcome_status TEXT DEFAULT 'pending',
+  meta TEXT DEFAULT '{}',
+  evaluated_at DATETIME,
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+  CONSTRAINT uq_entry_outcome_candidate_horizon UNIQUE(candidate_id, horizon_days)
+)
+"""
+        )
+    )
+    _create_index_if_missing(
+        conn,
+        "ix_entry_outcome_status_horizon",
+        "CREATE INDEX ix_entry_outcome_status_horizon ON entry_candidate_outcomes(outcome_status, horizon_days)",
+    )
+    _create_index_if_missing(
+        conn,
+        "ix_entry_outcome_symbol_day",
+        "CREATE INDEX ix_entry_outcome_symbol_day ON entry_candidate_outcomes(stock_market, stock_symbol, snapshot_date)",
+    )
+
+
+def _m111_strategy_layer(conn: Connection) -> None:
+    conn.execute(
+        text(
+            """
+CREATE TABLE IF NOT EXISTS strategy_catalog (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  code TEXT NOT NULL UNIQUE,
+  name TEXT NOT NULL,
+  description TEXT DEFAULT '',
+  version TEXT DEFAULT 'v1',
+  enabled INTEGER DEFAULT 1,
+  market_scope TEXT DEFAULT 'ALL',
+  risk_level TEXT DEFAULT 'medium',
+  params TEXT DEFAULT '{}',
+  default_weight REAL DEFAULT 1.0,
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+  updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+)
+"""
+        )
+    )
+    _create_index_if_missing(
+        conn,
+        "ix_strategy_catalog_enabled",
+        "CREATE INDEX ix_strategy_catalog_enabled ON strategy_catalog(enabled)",
+    )
+
+    conn.execute(
+        text(
+            """
+CREATE TABLE IF NOT EXISTS strategy_signal_runs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  snapshot_date TEXT NOT NULL,
+  stock_symbol TEXT NOT NULL,
+  stock_market TEXT NOT NULL DEFAULT 'CN',
+  stock_name TEXT DEFAULT '',
+  strategy_code TEXT NOT NULL,
+  strategy_name TEXT DEFAULT '',
+  strategy_version TEXT DEFAULT 'v1',
+  risk_level TEXT DEFAULT 'medium',
+  source_pool TEXT DEFAULT 'watchlist',
+  score REAL NOT NULL DEFAULT 0,
+  rank_score REAL NOT NULL DEFAULT 0,
+  confidence REAL,
+  status TEXT DEFAULT 'active',
+  action TEXT DEFAULT 'watch',
+  action_label TEXT DEFAULT '观望',
+  signal TEXT DEFAULT '',
+  reason TEXT DEFAULT '',
+  evidence TEXT DEFAULT '[]',
+  holding_days INTEGER DEFAULT 3,
+  entry_low REAL,
+  entry_high REAL,
+  stop_loss REAL,
+  target_price REAL,
+  invalidation TEXT DEFAULT '',
+  plan_quality INTEGER DEFAULT 0,
+  source_agent TEXT DEFAULT '',
+  source_suggestion_id INTEGER,
+  source_candidate_id INTEGER,
+  trace_id TEXT DEFAULT '',
+  is_holding_snapshot INTEGER DEFAULT 0,
+  context_quality_score REAL,
+  payload TEXT DEFAULT '{}',
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+  updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+  CONSTRAINT uq_strategy_signal_daily_unique UNIQUE(snapshot_date, stock_symbol, stock_market, strategy_code, source_candidate_id)
+)
+"""
+        )
+    )
+    _create_index_if_missing(
+        conn,
+        "ix_strategy_signal_snapshot_rank",
+        "CREATE INDEX ix_strategy_signal_snapshot_rank ON strategy_signal_runs(snapshot_date, rank_score)",
+    )
+    _create_index_if_missing(
+        conn,
+        "ix_strategy_signal_strategy_market",
+        "CREATE INDEX ix_strategy_signal_strategy_market ON strategy_signal_runs(strategy_code, stock_market)",
+    )
+    _create_index_if_missing(
+        conn,
+        "ix_strategy_signal_status",
+        "CREATE INDEX ix_strategy_signal_status ON strategy_signal_runs(status, updated_at)",
+    )
+
+    conn.execute(
+        text(
+            """
+CREATE TABLE IF NOT EXISTS strategy_outcomes (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  signal_run_id INTEGER NOT NULL REFERENCES strategy_signal_runs(id) ON DELETE CASCADE,
+  strategy_code TEXT NOT NULL,
+  snapshot_date TEXT DEFAULT '',
+  stock_symbol TEXT NOT NULL,
+  stock_market TEXT NOT NULL DEFAULT 'CN',
+  source_pool TEXT DEFAULT 'watchlist',
+  horizon_days INTEGER NOT NULL DEFAULT 1,
+  target_date TEXT DEFAULT '',
+  base_price REAL,
+  outcome_price REAL,
+  outcome_return_pct REAL,
+  hit_target INTEGER,
+  hit_stop INTEGER,
+  outcome_status TEXT DEFAULT 'pending',
+  meta TEXT DEFAULT '{}',
+  evaluated_at DATETIME,
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+  CONSTRAINT uq_strategy_outcome_signal_horizon UNIQUE(signal_run_id, horizon_days)
+)
+"""
+        )
+    )
+    _create_index_if_missing(
+        conn,
+        "ix_strategy_outcome_strategy_horizon",
+        "CREATE INDEX ix_strategy_outcome_strategy_horizon ON strategy_outcomes(strategy_code, horizon_days)",
+    )
+    _create_index_if_missing(
+        conn,
+        "ix_strategy_outcome_market_date",
+        "CREATE INDEX ix_strategy_outcome_market_date ON strategy_outcomes(stock_market, target_date)",
+    )
+    _create_index_if_missing(
+        conn,
+        "ix_strategy_outcome_status",
+        "CREATE INDEX ix_strategy_outcome_status ON strategy_outcomes(outcome_status, evaluated_at)",
+    )
+
+    conn.execute(
+        text(
+            """
+CREATE TABLE IF NOT EXISTS strategy_weights (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  strategy_code TEXT NOT NULL,
+  market TEXT NOT NULL DEFAULT 'ALL',
+  regime TEXT NOT NULL DEFAULT 'default',
+  weight REAL NOT NULL DEFAULT 1.0,
+  reason TEXT DEFAULT '',
+  meta TEXT DEFAULT '{}',
+  effective_from DATETIME DEFAULT CURRENT_TIMESTAMP,
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+  updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+  CONSTRAINT uq_strategy_weight_key UNIQUE(strategy_code, market, regime)
+)
+"""
+        )
+    )
+    _create_index_if_missing(
+        conn,
+        "ix_strategy_weight_effective",
+        "CREATE INDEX ix_strategy_weight_effective ON strategy_weights(effective_from)",
+    )
+
+    conn.execute(
+        text(
+            """
+CREATE TABLE IF NOT EXISTS strategy_weight_history (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  strategy_code TEXT NOT NULL,
+  market TEXT NOT NULL DEFAULT 'ALL',
+  regime TEXT NOT NULL DEFAULT 'default',
+  old_weight REAL NOT NULL DEFAULT 1.0,
+  new_weight REAL NOT NULL DEFAULT 1.0,
+  reason TEXT DEFAULT '',
+  window_days INTEGER DEFAULT 45,
+  sample_size INTEGER DEFAULT 0,
+  meta TEXT DEFAULT '{}',
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+)
+"""
+        )
+    )
+    _create_index_if_missing(
+        conn,
+        "ix_strategy_weight_history_time",
+        "CREATE INDEX ix_strategy_weight_history_time ON strategy_weight_history(created_at)",
+    )
+    _create_index_if_missing(
+        conn,
+        "ix_strategy_weight_history_strategy_market",
+        "CREATE INDEX ix_strategy_weight_history_strategy_market ON strategy_weight_history(strategy_code, market)",
+    )
+
+    # Seed strategy catalog (parameterized to avoid ':' bind parsing in JSON literals)
+    seed_sql = text(
+        """
+INSERT OR IGNORE INTO strategy_catalog(
+  code, name, description, version, enabled, market_scope, risk_level, params, default_weight
+)
+VALUES(
+  :code, :name, :description, :version, :enabled, :market_scope, :risk_level, :params, :default_weight
+)
+"""
+    )
+    seed_rows = [
+        {
+            "code": "trend_follow",
+            "name": "趋势延续",
+            "description": "顺势跟随，优先均线多头且动量延续",
+            "version": "v1",
+            "enabled": 1,
+            "market_scope": "ALL",
+            "risk_level": "medium",
+            "params": '{"horizon_days":5}',
+            "default_weight": 1.15,
+        },
+        {
+            "code": "macd_golden",
+            "name": "MACD金叉",
+            "description": "MACD 金叉确认，偏中短线",
+            "version": "v1",
+            "enabled": 1,
+            "market_scope": "ALL",
+            "risk_level": "medium",
+            "params": '{"horizon_days":3}',
+            "default_weight": 1.10,
+        },
+        {
+            "code": "volume_breakout",
+            "name": "放量突破",
+            "description": "放量突破关键位，偏进攻",
+            "version": "v1",
+            "enabled": 1,
+            "market_scope": "ALL",
+            "risk_level": "high",
+            "params": '{"horizon_days":3}',
+            "default_weight": 1.18,
+        },
+        {
+            "code": "pullback",
+            "name": "回踩确认",
+            "description": "回踩支撑后二次启动",
+            "version": "v1",
+            "enabled": 1,
+            "market_scope": "ALL",
+            "risk_level": "low",
+            "params": '{"horizon_days":5}',
+            "default_weight": 1.05,
+        },
+        {
+            "code": "rebound",
+            "name": "超跌反弹",
+            "description": "超跌后的反弹交易",
+            "version": "v1",
+            "enabled": 1,
+            "market_scope": "ALL",
+            "risk_level": "high",
+            "params": '{"horizon_days":3}',
+            "default_weight": 0.95,
+        },
+        {
+            "code": "watchlist_agent",
+            "name": "Agent建议",
+            "description": "来自既有 Agent 的综合建议映射",
+            "version": "v1",
+            "enabled": 1,
+            "market_scope": "ALL",
+            "risk_level": "medium",
+            "params": '{"horizon_days":3}',
+            "default_weight": 1.00,
+        },
+        {
+            "code": "market_scan",
+            "name": "市场扫描",
+            "description": "市场池扫描策略（热门与活跃）",
+            "version": "v1",
+            "enabled": 1,
+            "market_scope": "ALL",
+            "risk_level": "medium",
+            "params": '{"horizon_days":3}',
+            "default_weight": 1.08,
+        },
+    ]
+    for row in seed_rows:
+        conn.execute(seed_sql, row)
+
+    # Legacy smooth migration: entry_candidates -> strategy_signal_runs
+    if _has_table(conn, "entry_candidates"):
+        conn.execute(
+            text(
+                """
+INSERT OR IGNORE INTO strategy_signal_runs (
+  snapshot_date, stock_symbol, stock_market, stock_name,
+  strategy_code, strategy_name, strategy_version, risk_level, source_pool,
+  score, rank_score, confidence, status, action, action_label, signal, reason,
+  evidence, holding_days, entry_low, entry_high, stop_loss, target_price, invalidation,
+  plan_quality, source_agent, source_suggestion_id, source_candidate_id, trace_id,
+  is_holding_snapshot, payload, created_at, updated_at
+)
+SELECT
+  ec.snapshot_date,
+  ec.stock_symbol,
+  ec.stock_market,
+  ec.stock_name,
+  CASE
+    WHEN ec.strategy_tags LIKE '%trend_follow%' THEN 'trend_follow'
+    WHEN ec.strategy_tags LIKE '%macd_golden%' THEN 'macd_golden'
+    WHEN ec.strategy_tags LIKE '%volume_breakout%' THEN 'volume_breakout'
+    WHEN ec.strategy_tags LIKE '%pullback%' THEN 'pullback'
+    WHEN ec.strategy_tags LIKE '%rebound%' THEN 'rebound'
+    WHEN ec.candidate_source = 'market_scan' THEN 'market_scan'
+    ELSE 'watchlist_agent'
+  END AS strategy_code,
+  CASE
+    WHEN ec.strategy_tags LIKE '%trend_follow%' THEN '趋势延续'
+    WHEN ec.strategy_tags LIKE '%macd_golden%' THEN 'MACD金叉'
+    WHEN ec.strategy_tags LIKE '%volume_breakout%' THEN '放量突破'
+    WHEN ec.strategy_tags LIKE '%pullback%' THEN '回踩确认'
+    WHEN ec.strategy_tags LIKE '%rebound%' THEN '超跌反弹'
+    WHEN ec.candidate_source = 'market_scan' THEN '市场扫描'
+    ELSE 'Agent建议'
+  END AS strategy_name,
+  'v1' AS strategy_version,
+  CASE
+    WHEN ec.action IN ('buy', 'add') AND ec.score >= 80 THEN 'high'
+    WHEN ec.action IN ('watch', 'hold') THEN 'low'
+    ELSE 'medium'
+  END AS risk_level,
+  COALESCE(ec.candidate_source, 'watchlist') AS source_pool,
+  ec.score,
+  ec.score,
+  ec.confidence,
+  ec.status,
+  ec.action,
+  ec.action_label,
+  COALESCE(ec.signal, ''),
+  COALESCE(ec.reason, ''),
+  COALESCE(ec.evidence, '[]'),
+  3,
+  ec.entry_low,
+  ec.entry_high,
+  ec.stop_loss,
+  ec.target_price,
+  COALESCE(ec.invalidation, ''),
+  COALESCE(ec.plan_quality, 0),
+  COALESCE(ec.source_agent, ''),
+  ec.source_suggestion_id,
+  ec.id,
+  COALESCE(ec.source_trace_id, ''),
+  COALESCE(ec.is_holding_snapshot, 0),
+  COALESCE(ec.meta, '{}'),
+  ec.created_at,
+  ec.updated_at
+FROM entry_candidates ec
+"""
+            )
+        )
+
+    # Legacy smooth migration: entry_candidate_outcomes -> strategy_outcomes
+    if _has_table(conn, "entry_candidate_outcomes"):
+        conn.execute(
+            text(
+                """
+INSERT OR IGNORE INTO strategy_outcomes (
+  signal_run_id, strategy_code, snapshot_date, stock_symbol, stock_market, source_pool,
+  horizon_days, target_date, base_price, outcome_price, outcome_return_pct,
+  hit_target, hit_stop, outcome_status, meta, evaluated_at, created_at
+)
+SELECT
+  sr.id,
+  sr.strategy_code,
+  eco.snapshot_date,
+  eco.stock_symbol,
+  eco.stock_market,
+  COALESCE(eco.candidate_source, 'watchlist'),
+  eco.horizon_days,
+  eco.target_date,
+  eco.base_price,
+  eco.outcome_price,
+  eco.outcome_return_pct,
+  eco.hit_target,
+  eco.hit_stop,
+  eco.outcome_status,
+  COALESCE(eco.meta, '{}'),
+  eco.evaluated_at,
+  eco.created_at
+FROM entry_candidate_outcomes eco
+JOIN strategy_signal_runs sr ON sr.source_candidate_id = eco.candidate_id
+"""
+            )
+        )
+
+
+def _m112_strategy_analytics_snapshots(conn: Connection) -> None:
+    conn.execute(
+        text(
+            """
+CREATE TABLE IF NOT EXISTS market_regime_snapshots (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  snapshot_date TEXT NOT NULL,
+  market TEXT NOT NULL DEFAULT 'CN',
+  regime TEXT NOT NULL DEFAULT 'neutral',
+  regime_score REAL NOT NULL DEFAULT 0.0,
+  confidence REAL NOT NULL DEFAULT 0.0,
+  breadth_up_pct REAL,
+  avg_change_pct REAL,
+  volatility_pct REAL,
+  active_ratio REAL,
+  sample_size INTEGER DEFAULT 0,
+  meta TEXT DEFAULT '{}',
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+  updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+  CONSTRAINT uq_market_regime_day_market UNIQUE(snapshot_date, market)
+)
+"""
+        )
+    )
+    _create_index_if_missing(
+        conn,
+        "ix_market_regime_snapshot",
+        "CREATE INDEX ix_market_regime_snapshot ON market_regime_snapshots(snapshot_date, market)",
+    )
+    _create_index_if_missing(
+        conn,
+        "ix_market_regime_type",
+        "CREATE INDEX ix_market_regime_type ON market_regime_snapshots(regime)",
+    )
+
+    conn.execute(
+        text(
+            """
+CREATE TABLE IF NOT EXISTS strategy_factor_snapshots (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  signal_run_id INTEGER NOT NULL REFERENCES strategy_signal_runs(id) ON DELETE CASCADE,
+  snapshot_date TEXT NOT NULL,
+  stock_symbol TEXT NOT NULL,
+  stock_market TEXT NOT NULL DEFAULT 'CN',
+  strategy_code TEXT NOT NULL,
+  alpha_score REAL DEFAULT 0.0,
+  catalyst_score REAL DEFAULT 0.0,
+  quality_score REAL DEFAULT 0.0,
+  risk_penalty REAL DEFAULT 0.0,
+  crowd_penalty REAL DEFAULT 0.0,
+  source_bonus REAL DEFAULT 0.0,
+  regime_multiplier REAL DEFAULT 1.0,
+  final_score REAL NOT NULL DEFAULT 0.0,
+  factor_payload TEXT DEFAULT '{}',
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+  updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+  CONSTRAINT uq_strategy_factor_signal UNIQUE(signal_run_id)
+)
+"""
+        )
+    )
+    _create_index_if_missing(
+        conn,
+        "ix_strategy_factor_snapshot_score",
+        "CREATE INDEX ix_strategy_factor_snapshot_score ON strategy_factor_snapshots(snapshot_date, final_score)",
+    )
+    _create_index_if_missing(
+        conn,
+        "ix_strategy_factor_strategy_market",
+        "CREATE INDEX ix_strategy_factor_strategy_market ON strategy_factor_snapshots(strategy_code, stock_market)",
+    )
+
+    conn.execute(
+        text(
+            """
+CREATE TABLE IF NOT EXISTS portfolio_risk_snapshots (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  snapshot_date TEXT NOT NULL,
+  market TEXT NOT NULL DEFAULT 'CN',
+  total_signals INTEGER DEFAULT 0,
+  active_signals INTEGER DEFAULT 0,
+  held_signals INTEGER DEFAULT 0,
+  unheld_signals INTEGER DEFAULT 0,
+  high_risk_ratio REAL,
+  concentration_top5 REAL,
+  avg_rank_score REAL,
+  risk_level TEXT DEFAULT 'medium',
+  meta TEXT DEFAULT '{}',
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+  updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+  CONSTRAINT uq_portfolio_risk_day_market UNIQUE(snapshot_date, market)
+)
+"""
+        )
+    )
+    _create_index_if_missing(
+        conn,
+        "ix_portfolio_risk_snapshot",
+        "CREATE INDEX ix_portfolio_risk_snapshot ON portfolio_risk_snapshots(snapshot_date, market)",
+    )
+
+    if not _has_table(conn, "strategy_signal_runs"):
+        return
+
+    rows = conn.execute(
+        text(
+            """
+SELECT
+  id,
+  snapshot_date,
+  stock_symbol,
+  stock_market,
+  strategy_code,
+  status,
+  risk_level,
+  rank_score,
+  is_holding_snapshot,
+  payload
+FROM strategy_signal_runs
+ORDER BY snapshot_date DESC, stock_market ASC, rank_score DESC
+"""
+        )
+    ).fetchall()
+    if not rows:
+        return
+
+    factor_insert = text(
+        """
+INSERT OR IGNORE INTO strategy_factor_snapshots(
+  signal_run_id, snapshot_date, stock_symbol, stock_market, strategy_code,
+  alpha_score, catalyst_score, quality_score, risk_penalty, crowd_penalty, source_bonus,
+  regime_multiplier, final_score, factor_payload
+)
+VALUES(
+  :signal_run_id, :snapshot_date, :stock_symbol, :stock_market, :strategy_code,
+  :alpha_score, :catalyst_score, :quality_score, :risk_penalty, :crowd_penalty, :source_bonus,
+  :regime_multiplier, :final_score, :factor_payload
+)
+"""
+    )
+
+    bucket: dict[tuple[str, str], dict] = {}
+    for r in rows:
+        signal_id = int(r[0])
+        snapshot_date = str(r[1] or "")
+        stock_symbol = str(r[2] or "")
+        stock_market = str(r[3] or "CN")
+        strategy_code = str(r[4] or "")
+        status = str(r[5] or "")
+        risk_level = str(r[6] or "medium")
+        rank_score = float(r[7] or 0.0)
+        is_holding = bool(r[8] or 0)
+        payload_raw = r[9]
+
+        payload_obj = {}
+        if isinstance(payload_raw, str) and payload_raw.strip():
+            try:
+                payload_obj = json.loads(payload_raw)
+            except Exception:
+                payload_obj = {}
+        elif isinstance(payload_raw, dict):
+            payload_obj = payload_raw
+
+        change_pct = None
+        source_meta = payload_obj.get("source_meta") if isinstance(payload_obj, dict) else None
+        if isinstance(source_meta, dict):
+            quote = source_meta.get("quote") if isinstance(source_meta.get("quote"), dict) else {}
+            try:
+                if quote.get("change_pct") is not None:
+                    change_pct = float(quote.get("change_pct"))
+            except Exception:
+                change_pct = None
+
+        # Backfill factor snapshot with conservative decomposition.
+        conn.execute(
+            factor_insert,
+            {
+                "signal_run_id": signal_id,
+                "snapshot_date": snapshot_date,
+                "stock_symbol": stock_symbol,
+                "stock_market": stock_market,
+                "strategy_code": strategy_code,
+                "alpha_score": round(rank_score * 0.35, 4),
+                "catalyst_score": 0.0,
+                "quality_score": round(rank_score * 0.15, 4),
+                "risk_penalty": 0.0,
+                "crowd_penalty": 0.0,
+                "source_bonus": 0.0,
+                "regime_multiplier": 1.0,
+                "final_score": round(rank_score, 4),
+                "factor_payload": json.dumps(
+                    {
+                        "backfilled": True,
+                        "change_pct": change_pct,
+                    },
+                    ensure_ascii=False,
+                ),
+            },
+        )
+
+        key = (snapshot_date, stock_market)
+        agg = bucket.setdefault(
+            key,
+            {
+                "scores": [],
+                "changes": [],
+                "total": 0,
+                "active": 0,
+                "held": 0,
+                "high_risk": 0,
+            },
+        )
+        agg["total"] += 1
+        if status == "active":
+            agg["active"] += 1
+        if is_holding:
+            agg["held"] += 1
+        if risk_level == "high":
+            agg["high_risk"] += 1
+        agg["scores"].append(rank_score)
+        if change_pct is not None:
+            agg["changes"].append(change_pct)
+
+    regime_insert = text(
+        """
+INSERT OR REPLACE INTO market_regime_snapshots(
+  snapshot_date, market, regime, regime_score, confidence, breadth_up_pct,
+  avg_change_pct, volatility_pct, active_ratio, sample_size, meta, updated_at
+)
+VALUES(
+  :snapshot_date, :market, :regime, :regime_score, :confidence, :breadth_up_pct,
+  :avg_change_pct, :volatility_pct, :active_ratio, :sample_size, :meta, CURRENT_TIMESTAMP
+)
+"""
+    )
+    risk_insert = text(
+        """
+INSERT OR REPLACE INTO portfolio_risk_snapshots(
+  snapshot_date, market, total_signals, active_signals, held_signals, unheld_signals,
+  high_risk_ratio, concentration_top5, avg_rank_score, risk_level, meta, updated_at
+)
+VALUES(
+  :snapshot_date, :market, :total_signals, :active_signals, :held_signals, :unheld_signals,
+  :high_risk_ratio, :concentration_top5, :avg_rank_score, :risk_level, :meta, CURRENT_TIMESTAMP
+)
+"""
+    )
+
+    for (snap, market), agg in bucket.items():
+        total = int(agg["total"] or 0)
+        active = int(agg["active"] or 0)
+        held = int(agg["held"] or 0)
+        unheld = max(0, total - held)
+        scores = sorted([float(x) for x in agg["scores"] if x is not None], reverse=True)
+        score_sum = sum(scores)
+        avg_score = (score_sum / total) if total else 0.0
+        top5 = sum(scores[:5])
+        concentration = (top5 / score_sum) if score_sum > 0 else 0.0
+        high_risk_ratio = (float(agg["high_risk"]) / total) if total else 0.0
+
+        changes = [float(x) for x in agg["changes"] if x is not None]
+        breadth_up_pct = (
+            sum(1 for c in changes if c > 0) / len(changes) * 100.0 if changes else None
+        )
+        avg_change_pct = (sum(changes) / len(changes)) if changes else None
+        volatility_pct = None
+        if len(changes) >= 2:
+            mean = sum(changes) / len(changes)
+            variance = sum((c - mean) ** 2 for c in changes) / (len(changes) - 1)
+            volatility_pct = variance ** 0.5
+
+        active_ratio = (active / total) if total else 0.0
+        breadth_norm = (
+            max(-1.0, min(1.0, ((breadth_up_pct or 50.0) - 50.0) / 50.0))
+            if breadth_up_pct is not None
+            else 0.0
+        )
+        change_norm = (
+            max(-1.0, min(1.0, (avg_change_pct or 0.0) / 3.0))
+            if avg_change_pct is not None
+            else 0.0
+        )
+        active_norm = max(-1.0, min(1.0, (active_ratio - 0.5) / 0.5))
+        regime_score = 0.45 * breadth_norm + 0.30 * change_norm + 0.25 * active_norm
+        if regime_score >= 0.20:
+            regime = "bullish"
+        elif regime_score <= -0.20:
+            regime = "bearish"
+        else:
+            regime = "neutral"
+        confidence = min(
+            1.0,
+            max(0.0, abs(regime_score) * 1.4 + min(0.4, total / 250.0)),
+        )
+
+        if high_risk_ratio >= 0.45 or concentration >= 0.65:
+            risk_level = "high"
+        elif high_risk_ratio >= 0.28 or concentration >= 0.48:
+            risk_level = "medium"
+        else:
+            risk_level = "low"
+
+        conn.execute(
+            regime_insert,
+            {
+                "snapshot_date": snap,
+                "market": market,
+                "regime": regime,
+                "regime_score": round(regime_score, 4),
+                "confidence": round(confidence, 4),
+                "breadth_up_pct": round(breadth_up_pct, 4) if breadth_up_pct is not None else None,
+                "avg_change_pct": round(avg_change_pct, 4) if avg_change_pct is not None else None,
+                "volatility_pct": round(volatility_pct, 4) if volatility_pct is not None else None,
+                "active_ratio": round(active_ratio, 4),
+                "sample_size": total,
+                "meta": json.dumps(
+                    {
+                        "from_strategy_runs": True,
+                        "active_signals": active,
+                    },
+                    ensure_ascii=False,
+                ),
+            },
+        )
+        conn.execute(
+            risk_insert,
+            {
+                "snapshot_date": snap,
+                "market": market,
+                "total_signals": total,
+                "active_signals": active,
+                "held_signals": held,
+                "unheld_signals": unheld,
+                "high_risk_ratio": round(high_risk_ratio, 4),
+                "concentration_top5": round(concentration, 4),
+                "avg_rank_score": round(avg_score, 4),
+                "risk_level": risk_level,
+                "meta": json.dumps(
+                    {
+                        "from_strategy_runs": True,
+                        "score_sum": round(score_sum, 4),
+                    },
+                    ensure_ascii=False,
+                ),
+            },
+        )
+
+
+def _m113_market_scan_snapshot_and_mixed_source(conn: Connection) -> None:
+    conn.execute(
+        text(
+            """
+CREATE TABLE IF NOT EXISTS market_scan_snapshots (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  snapshot_date TEXT NOT NULL,
+  stock_symbol TEXT NOT NULL,
+  stock_market TEXT NOT NULL DEFAULT 'CN',
+  stock_name TEXT DEFAULT '',
+  source TEXT NOT NULL DEFAULT 'market_scan',
+  score_seed REAL NOT NULL DEFAULT 0.0,
+  quote TEXT DEFAULT '{}',
+  meta TEXT DEFAULT '{}',
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+  updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+  CONSTRAINT uq_market_scan_snapshot_symbol UNIQUE(snapshot_date, stock_symbol, stock_market)
+)
+"""
+        )
+    )
+    _create_index_if_missing(
+        conn,
+        "ix_market_scan_snapshot_day_market",
+        "CREATE INDEX ix_market_scan_snapshot_day_market ON market_scan_snapshots(snapshot_date, stock_market)",
+    )
+    _create_index_if_missing(
+        conn,
+        "ix_market_scan_snapshot_source",
+        "CREATE INDEX ix_market_scan_snapshot_source ON market_scan_snapshots(snapshot_date, source)",
+    )
+
+    if _has_table(conn, "entry_candidates"):
+        conn.execute(
+            text(
+                """
+UPDATE entry_candidates
+SET candidate_source = 'mixed'
+WHERE candidate_source = 'market_scan'
+  AND source_suggestion_id IS NOT NULL
+"""
+            )
+        )
+    if _has_table(conn, "strategy_signal_runs"):
+        conn.execute(
+            text(
+                """
+UPDATE strategy_signal_runs
+SET source_pool = 'mixed'
+WHERE source_pool = 'market_scan'
+  AND source_suggestion_id IS NOT NULL
+"""
+            )
+        )
+
+
 MIGRATIONS: tuple[Migration, ...] = (
     Migration(101, "agent_config_kind_and_visibility", _m101_agent_config_kind),
     Migration(102, "backfill_agent_kind_data", _m102_backfill_agent_kind),
@@ -364,6 +1401,13 @@ MIGRATIONS: tuple[Migration, ...] = (
     Migration(104, "analysis_history_kind_snapshot", _m104_history_kind_snapshot),
     Migration(105, "indexes_for_agent_kind_and_history", _m105_indexes),
     Migration(106, "log_entry_observability_fields", _m106_log_observability),
+    Migration(107, "stock_suggestion_market_dimension", _m107_suggestion_market_dimension),
+    Migration(108, "entry_candidates_table", _m108_entry_candidates_table),
+    Migration(109, "entry_candidate_upgrade", _m109_entry_candidate_upgrade),
+    Migration(110, "entry_candidate_outcomes", _m110_entry_candidate_outcomes),
+    Migration(111, "strategy_layer", _m111_strategy_layer),
+    Migration(112, "strategy_analytics_snapshots", _m112_strategy_analytics_snapshots),
+    Migration(113, "market_scan_snapshot_and_mixed_source", _m113_market_scan_snapshot_and_mixed_source),
 )
 
 

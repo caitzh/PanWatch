@@ -452,71 +452,28 @@ class IntradayMonitorAgent(BaseAgent):
             lines.append("\n## 历史分析参考")
 
             if daily_analysis:
-                # 提取当前股票相关的内容
-                stock_related = self._extract_stock_section(
-                    daily_analysis, stock.symbol, stock.name
+                # 截取与当前股票相关的部分（最多 300 字）
+                content = (
+                    daily_analysis[:300] + "..."
+                    if len(daily_analysis) > 300
+                    else daily_analysis
                 )
-                if stock_related:
-                    lines.append(f"\n### 昨日盘后分析摘要")
-                    lines.append(stock_related)
+                lines.append(f"\n### 昨日盘后分析摘要")
+                lines.append(content)
 
             if premarket_analysis:
-                stock_related = self._extract_stock_section(
-                    premarket_analysis, stock.symbol, stock.name
+                content = (
+                    premarket_analysis[:300] + "..."
+                    if len(premarket_analysis) > 300
+                    else premarket_analysis
                 )
-                if stock_related:
-                    lines.append(f"\n### 今日盘前分析摘要")
-                    lines.append(stock_related)
+                lines.append(f"\n### 今日盘前分析摘要")
+                lines.append(content)
 
         lines.append("\n请结合技术分析、资金情况和历史分析，给出明确的操作建议。")
 
         user_content = "\n".join(lines)
         return system_prompt, user_content
-
-    def _extract_stock_section(
-        self, content: str, symbol: str, name: str, max_length: int = 300
-    ) -> str:
-        """
-        从全局分析中提取特定股票相关的内容
-
-        支持的格式：
-        - ### 股票名称（代码）
-        - ### 股票名称(代码)
-        - 「股票代码 股票名称」
-        """
-        if not content:
-            return ""
-
-        import re
-
-        # 方式1: 匹配 ### 股票名称（代码）格式
-        patterns = [
-            rf"###\s*{re.escape(name)}[（(]{symbol}[）)]",  # ### 股票名称（代码）
-            rf"###\s*{re.escape(name)}",  # ### 股票名称
-            rf"「{symbol}\s*{re.escape(name)}」",  # 「股票代码 股票名称」
-        ]
-
-        for pattern in patterns:
-            match = re.search(pattern, content)
-            if match:
-                # 从匹配位置开始，提取到下一个 ### 或 ## 或文档末尾
-                start = match.start()
-                rest = content[start:]
-
-                # 查找下一个章节标题
-                next_section = re.search(r"\n##", rest[1:])  # 跳过当前行的 #
-                if next_section:
-                    section = rest[: next_section.start() + 1]
-                else:
-                    section = rest
-
-                # 限制长度
-                if len(section) > max_length:
-                    section = section[:max_length] + "..."
-                return section.strip()
-
-        # 未找到特定股票内容，返回空（不返回全局内容）
-        return ""
 
     def _parse_suggestion(self, content: str) -> dict:
         """
@@ -577,6 +534,13 @@ class IntradayMonitorAgent(BaseAgent):
             result["action_label"] = "持有"
             return result
 
+        # 提取建议类型（从全文搜索）
+        for label, action in SUGGESTION_TYPES.items():
+            if label in content:
+                result["action"] = action
+                result["action_label"] = label
+                break
+
         # 提取信号（支持多种格式）
         signal_patterns = [
             r"「信号」\s*[:：]?\s*(.+?)(?=「|$|\n\n)",
@@ -595,22 +559,21 @@ class IntradayMonitorAgent(BaseAgent):
             r"\*\*建议\*\*\s*[:：]?\s*(.+?)(?=\*\*|$|\n\n)",
             r"建议\s*[:：]\s*(.+?)(?=\n|$)",
         ]
-        suggestion_text = ""
         for pattern in suggest_patterns:
             match = re.search(pattern, content, re.DOTALL)
             if match:
-                suggestion_text = match.group(1).strip()
+                suggest_text = match.group(1).strip()
+                # 从建议中提取操作类型
+                for label, action in SUGGESTION_TYPES.items():
+                    if label in suggest_text:
+                        result["action"] = action
+                        result["action_label"] = label
+                        break
+                # 如果信号为空，使用建议内容作为信号
+                if not result["signal"]:
+                    result["signal"] = suggest_text[:50]
                 break
 
-        # 从建议文本中提取建议类型（只在建议字段中搜索，避免误匹配）
-        if suggestion_text:
-            for label, action in SUGGESTION_TYPES.items():
-                # 确保是完整词匹配，避免"暂不建仓"被误识别为"建仓"
-                if label in suggestion_text.split("，")[0].split(",")[0]:  # 只在第一个逗号前搜索
-                    result["action"] = action
-                    result["action_label"] = label
-                    result["should_alert"] = True
-                    break
         # 提取理由（支持多种格式）
         reason_patterns = [
             r"「理由」\s*[:：]?\s*(.+?)(?=「|$|\n\n)",
@@ -631,18 +594,8 @@ class IntradayMonitorAgent(BaseAgent):
             if not clean_content.startswith("[无需提醒]"):
                 result["reason"] = clean_content[:100]
 
-        # 最终 should_alert 判定（只控制是否发送通知，不影响建议池保存）：
-        # - 明确操作（建仓/加仓/减仓/清仓）：发送通知
-        # - 观望但有明确风险信号（价格异动等）：发送通知提醒用户注意
-        # - 持有/观望无明确信号：不发送通知（避免干扰）
-        if result["action"] in {"buy", "add", "reduce", "sell"}:
-            result["should_alert"] = True
-        elif result["action"] == "watch" and result["signal"]:
-            # 观望但有信号（如价格异动、技术突破等），也通知用户注意
-            result["should_alert"] = True
-        else:
-            result["should_alert"] = False
-        
+        # 最终 should_alert 判定：只在明确“建仓/加仓/减仓/清仓”时提醒
+        result["should_alert"] = result["action"] in {"buy", "add", "reduce", "sell"}
         return result
 
     def _try_parse_loose_json(self, text: str) -> dict | None:
@@ -776,79 +729,75 @@ class IntradayMonitorAgent(BaseAgent):
         if try_parse_action_json(raw_content) or self._try_parse_loose_json(raw_content):
             content = self._format_human_readable_content(stock, suggestion, raw_content)
 
-        # 特殊情况：AI 明确返回 [无需提醒] 时，不保存建议（既不显示也不通知）
-        if "[无需提醒]" in content:
-            logger.info(f"AI 判断无需提醒，跳过保存建议: {stock.symbol}")
-        else:
-            # 其他所有情况都保存到建议池（供前端显示）
-            # should_alert 只控制是否发送推送通知
-            save_suggestion(
-                stock_symbol=stock.symbol,
-                stock_name=stock.name,
-                action=suggestion["action"],
-                action_label=suggestion["action_label"],
-                signal=suggestion.get("signal", ""),
-                reason=suggestion.get("reason", ""),
+        # 保存到建议池（包含 prompt 上下文）
+        save_suggestion(
+            stock_symbol=stock.symbol,
+            stock_name=stock.name,
+            action=suggestion["action"],
+            action_label=suggestion["action_label"],
+            signal=suggestion.get("signal", ""),
+            reason=suggestion.get("reason", ""),
+            agent_name=self.name,
+            agent_label=self.display_name,
+            expires_hours=6,  # 盘中建议 6 小时有效
+            prompt_context=user_content,  # 保存 prompt 上下文
+            ai_response=raw_content,  # 保存 AI 原始响应
+            stock_market=stock.market.value,
+            meta={
+                "quote": {
+                    "current_price": stock.current_price,
+                    "change_pct": stock.change_pct,
+                },
+                "kline_meta": {
+                    "computed_at": (data.get("kline_summary") or {}).get("computed_at"),
+                    "asof": (data.get("kline_summary") or {}).get("asof"),
+                },
+                "event_gate": data.get("event_gate"),
+                "analysis_date": analysis_date,
+                "context_quality_score": quality_score,
+                "plan": {
+                    "triggers": suggestion.get("triggers")
+                    if isinstance(suggestion, dict)
+                    else [],
+                    "invalidations": suggestion.get("invalidations")
+                    if isinstance(suggestion, dict)
+                    else [],
+                    "risks": suggestion.get("risks")
+                    if isinstance(suggestion, dict)
+                    else [],
+                },
+            },
+        )
+        for horizon in (1, 5):
+            save_agent_prediction_outcome(
                 agent_name=self.name,
-                agent_label=self.display_name,
-                expires_hours=6,  # 盘中建议 6 小时有效
-                prompt_context=user_content,  # 保存 prompt 上下文
-                ai_response=raw_content,  # 保存 AI 原始响应
+                stock_symbol=stock.symbol,
+                stock_market=stock.market.value,
+                prediction_date=analysis_date,
+                horizon_days=horizon,
+                action=suggestion.get("action") or "watch",
+                action_label=suggestion.get("action_label") or "观望",
+                confidence=(float(quality_score) / 100.0)
+                if quality_score is not None
+                else None,
+                trigger_price=getattr(stock, "current_price", None),
                 meta={
-                    "quote": {
-                        "current_price": stock.current_price,
-                        "change_pct": stock.change_pct,
-                    },
-                    "kline_meta": {
-                        "computed_at": (data.get("kline_summary") or {}).get("computed_at"),
-                        "asof": (data.get("kline_summary") or {}).get("asof"),
-                    },
-                    "event_gate": data.get("event_gate"),
-                    "analysis_date": analysis_date,
-                    "context_quality_score": quality_score,
-                    "plan": {
-                        "triggers": suggestion.get("triggers")
-                        if isinstance(suggestion, dict)
-                        else [],
-                        "invalidations": suggestion.get("invalidations")
-                        if isinstance(suggestion, dict)
-                        else [],
-                        "risks": suggestion.get("risks")
-                        if isinstance(suggestion, dict)
-                        else [],
-                    },
+                    "source": "intraday_monitor",
+                    "reason": suggestion.get("reason", ""),
+                    "signal": suggestion.get("signal", ""),
                 },
             )
-            for horizon in (1, 5):
-                save_agent_prediction_outcome(
-                    agent_name=self.name,
-                    stock_symbol=stock.symbol,
-                    stock_market=stock.market.value,
-                    prediction_date=analysis_date,
-                    horizon_days=horizon,
-                    action=suggestion.get("action") or "watch",
-                    action_label=suggestion.get("action_label") or "观望",
-                    confidence=(float(quality_score) / 100.0)
-                    if quality_score is not None
-                    else None,
-                    trigger_price=getattr(stock, "current_price", None),
-                    meta={
-                        "source": "intraday_monitor",
-                        "reason": suggestion.get("reason", ""),
-                        "signal": suggestion.get("signal", ""),
-                    },
-                )
 
-            save_agent_context_run(
-                agent_name=self.name,
-                stock_symbol=stock.symbol,
-                analysis_date=analysis_date,
-                context_payload={
-                    "symbol_context": data.get("symbol_context") or {},
-                    "quality_overview": data.get("quality_overview") or {},
-                },
-                quality={"score": quality_score or 0},
-            )
+        save_agent_context_run(
+            agent_name=self.name,
+            stock_symbol=stock.symbol,
+            analysis_date=analysis_date,
+            context_payload={
+                "symbol_context": data.get("symbol_context") or {},
+                "quality_overview": data.get("quality_overview") or {},
+            },
+            quality={"score": quality_score or 0},
+        )
 
         # 构建标题
         title = f"【{self.display_name}】{stock.name} {stock.change_pct:+.2f}%"

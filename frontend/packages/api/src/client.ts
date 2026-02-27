@@ -1,4 +1,5 @@
 const API_BASE = '/api'
+const DEFAULT_TIMEOUT_MS = 20000
 
 interface ApiResponse<T> {
   code: number
@@ -29,7 +30,11 @@ export function isAuthenticated(): boolean {
   return true
 }
 
-export async function fetchAPI<T>(path: string, options?: RequestInit): Promise<T> {
+export interface ApiRequestOptions extends RequestInit {
+  timeoutMs?: number
+}
+
+export async function fetchAPI<T>(path: string, options?: ApiRequestOptions): Promise<T> {
   const headers: Record<string, string> = {}
 
   const token = getToken()
@@ -41,10 +46,35 @@ export async function fetchAPI<T>(path: string, options?: RequestInit): Promise<
     headers['Content-Type'] = 'application/json'
   }
 
-  const res = await fetch(`${API_BASE}${path}`, {
-    headers,
-    ...options,
-  })
+  const timeoutController = options?.signal ? null : new AbortController()
+  const timeoutMs = typeof options?.timeoutMs === 'number' && options.timeoutMs > 0
+    ? options.timeoutMs
+    : DEFAULT_TIMEOUT_MS
+  const timeoutId = timeoutController
+    ? window.setTimeout(() => timeoutController.abort(), timeoutMs)
+    : null
+
+  let res: Response
+  try {
+    const { timeoutMs: _timeoutMs, ...requestOptions } = options || {}
+    res = await fetch(`${API_BASE}${path}`, {
+      ...requestOptions,
+      headers: {
+        ...headers,
+        ...(requestOptions.headers as Record<string, string> | undefined),
+      },
+      signal: requestOptions.signal || timeoutController?.signal,
+    })
+  } catch (error: any) {
+    if (error?.name === 'AbortError') {
+      throw new Error('请求超时，请稍后重试')
+    }
+    throw error
+  } finally {
+    if (timeoutId !== null) {
+      window.clearTimeout(timeoutId)
+    }
+  }
 
   if (res.status === 401) {
     logout()

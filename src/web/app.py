@@ -22,6 +22,8 @@ from src.web.api import (
     discovery,
     price_alerts,
     context,
+    recommendations,
+    dashboard,
 )
 from src.web.api import insights
 from src.web.api.auth import get_current_user
@@ -127,6 +129,18 @@ app.include_router(
     price_alerts.router,
     prefix="/api/price-alerts",
     tags=["price-alerts"],
+    dependencies=protected,
+)
+app.include_router(
+    recommendations.router,
+    prefix="/api/recommendations",
+    tags=["recommendations"],
+    dependencies=protected,
+)
+app.include_router(
+    dashboard.router,
+    prefix="/api/dashboard",
+    tags=["dashboard"],
     dependencies=protected,
 )
 
