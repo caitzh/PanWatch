@@ -767,6 +767,18 @@ export default function OpportunitiesPage() {
                   <div>风险惩罚: {formatMetric(breakdown.risk_penalty)}</div>
                   <div>相对强弱: {crossFeature.relative_strength_pct != null ? `${Number(crossFeature.relative_strength_pct).toFixed(0)}分位` : '--'}</div>
                   <div>事件催化: {eventScore != null ? eventScore.toFixed(1) : '--'}{eventCount > 0 ? `（${eventCount}条）` : '（无命中）'}</div>
+                  <div>
+                    基本面:&nbsp;
+                    {breakdown.fundamental_available === false
+                      ? <span className="text-muted-foreground/40 italic">无数据</span>
+                      : formatMetric(breakdown.fundamental_score)}
+                  </div>
+                  <div>
+                    资金流:&nbsp;
+                    {breakdown.capital_flow_available === false
+                      ? <span className="text-muted-foreground/40 italic">无数据</span>
+                      : formatMetric(breakdown.capital_flow_score)}
+                  </div>
                 </div>
                 {item.constrained && (
                   <div className="mt-2 text-[10px] text-amber-400">

@@ -155,6 +155,10 @@ export interface StrategySignalItem {
     base_score?: number
     alpha_score?: number
     catalyst_score?: number
+    fundamental_score?: number
+    fundamental_available?: boolean
+    capital_flow_score?: number
+    capital_flow_available?: boolean
     quality_score?: number
     risk_penalty?: number
     crowd_penalty?: number
