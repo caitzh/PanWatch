@@ -321,29 +321,39 @@ def _calculate_macd(
 
 
 def _calculate_rsi(closes: list[float], period: int) -> float | None:
-    """计算 RSI"""
+    """计算 RSI（使用 Wilder 平滑算法）
+
+    标准 RSI 使用指数移动平均而非简单平均，避免数值跳跃。
+    初始化：前 period 个变化的简单平均
+    后续：Wilder 平滑 = (prev_avg * (period - 1) + current) / period
+    """
     if len(closes) < period + 1:
         return None
 
-    gains = []
-    losses = []
+    # 计算每日涨跌幅
+    gains: list[float] = []
+    losses: list[float] = []
     for i in range(1, len(closes)):
         change = closes[i] - closes[i - 1]
-        if change > 0:
-            gains.append(change)
-            losses.append(0)
-        else:
-            gains.append(0)
-            losses.append(abs(change))
+        gains.append(max(change, 0.0))
+        losses.append(abs(min(change, 0.0)))
 
-    # 使用最近 period 天计算
-    avg_gain = sum(gains[-period:]) / period
-    avg_loss = sum(losses[-period:]) / period
+    if len(gains) < period:
+        return None
+
+    # 初始化：前 period 个的简单平均
+    avg_gain = sum(gains[:period]) / period
+    avg_loss = sum(losses[:period]) / period
+
+    # Wilder 平滑：递推计算
+    for i in range(period, len(gains)):
+        avg_gain = (avg_gain * (period - 1) + gains[i]) / period
+        avg_loss = (avg_loss * (period - 1) + losses[i]) / period
 
     if avg_loss == 0:
         return 100.0
     rs = avg_gain / avg_loss
-    return 100 - (100 / (1 + rs))
+    return 100.0 - (100.0 / (1.0 + rs))
 
 
 def _calculate_kdj(

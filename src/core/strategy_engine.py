@@ -922,6 +922,8 @@ def _compute_factor_breakdown(
     cross_feature: dict | None = None,
     news_metric: dict | None = None,
     strategy_win_rate: float | None = None,
+    fundamental: dict | None = None,
+    capital_flow: dict | None = None,
 ) -> dict:
     # 策略层基础分：按操作类型设定上限，留出因子加成空间
     # 注意：比 entry_candidates 层的 ACTION_BASE_SCORE 低，因为还有多个正向因子叠加
@@ -951,10 +953,11 @@ def _compute_factor_breakdown(
     event_bias = float(_safe_float(nm.get("event_bias")) or 0.0)
     event_count = int(nm.get("news_count") or 0)
 
-    # base_score：按 action 类型取基础分，再用候选评分做小幅质量调整 [-5, +8]
-    # 候选评分 >= 60 分时正向加成，< 60 时负向惩罚，保留候选质量信息但不作为主体
+    # base_score：按 action 类型取基础分，再用候选评分做小幅质量调整 [-6, +10]
+    # 候选评分参考中心从 60 改为 65（对齐 entry_candidates 层 buy=78 与策略层 buy=60 的差值）
+    # 系数从 /5.0 改为 /4.5，扩大微调效果
     base_score = _SCORE_BASE.get(action, 38.0)
-    candidate_adj = _clamp((float(row.score or 0.0) - 60.0) / 5.0, -5.0, 8.0)
+    candidate_adj = _clamp((float(row.score or 0.0) - 65.0) / 4.5, -6.0, 10.0)
     base_score += candidate_adj
 
     # alpha_score：来自横截面相对强度排名（与 base_score 解耦，避免重复计数）
@@ -967,12 +970,11 @@ def _compute_factor_breakdown(
     catalyst_score = 0.0
     if is_market_scan:
         catalyst_score += 2.5
-    # 价格动量：适度涨幅正向，过热反而有回调风险
+    # 价格动量：适度涨幅正向，过热交给 crowd_penalty 处理（避免双重计数）
     if quote_change_pct is not None:
         if 1.0 <= quote_change_pct <= 7.0:
             catalyst_score += 4.0
-        elif quote_change_pct > 9.0:
-            catalyst_score += 1.5
+        # 涨幅 >9% 时不加分也不减分，交给 crowd_penalty 处理
         elif quote_change_pct < -4.0:
             catalyst_score -= 2.5
     # 技术信号（不与 alpha_score 的横截面排名重复）
@@ -983,12 +985,11 @@ def _compute_factor_breakdown(
     if "超跌" in signal_text:
         catalyst_score += 1.0
     # 量比信号：衡量放量质量（相对历史均量的倍数），比绝对换手额更有意义
-    # 健康放量（1.5-4x）是趋势延续的核心特征；异常放量（>5x）往往是主力出货尾声
+    # 健康放量（1.5-4x）是趋势延续的核心特征；异常放量（>5x）交给 crowd_penalty 处理（避免双重计数）
     if volume_ratio is not None:
         if 1.5 <= volume_ratio <= 4.0:
             catalyst_score += 2.0   # 健康放量：趋势延续信号
-        elif volume_ratio > 5.0:
-            catalyst_score -= 1.5   # 异常放量：可能是出货，移至 crowd_penalty 也处理
+        # 量比 >5x 时不加分也不减分，交给 crowd_penalty 处理
         elif volume_ratio < 0.5:
             catalyst_score -= 1.0   # 严重缩量：弱势，动能不足
     # 新闻事件催化
@@ -1020,12 +1021,104 @@ def _compute_factor_breakdown(
     # 涨幅过热：短线冲高后回调风险大
     if quote_change_pct is not None and quote_change_pct >= 9.0:
         crowd_penalty += 2.5
-    # 量比过大：>5x 异常放量，可能是主力拉高出货（与 catalyst 的 -1.5 形成双重抑制）
+    # 量比过大：>5x 异常放量，可能是主力拉高出货（catalyst 层已移除对此的惩罚）
     if volume_ratio is not None and volume_ratio > 5.0:
         crowd_penalty += 2.0
     # 注意：删除绝对换手额（turnover >= 8e9）的惩罚，因不同市值股票无可比性
     # 换手率的相对量（量比）已由上方和 catalyst 处理
     crowd_penalty += _clamp(crowding_risk, 0.0, 6.0)
+
+    # fundamental_score：基本面质量评分（仅 CN 市场）
+    # 数据降级：无数据时为 0，不阻断评分
+    fundamental_score = 0.0
+    f = fundamental if isinstance(fundamental, dict) else {}
+    if f and not f.get("error"):
+        roe = _safe_float(f.get("roe"))
+        net_profit_yoy = _safe_float(f.get("net_profit_yoy"))
+        gross_margin = _safe_float(f.get("gross_margin"))
+        debt_ratio = _safe_float(f.get("debt_ratio"))
+
+        # ROE: 盈利能力核心指标
+        if roe is not None:
+            if roe >= 15.0:
+                fundamental_score += 2.5
+            elif roe >= 10.0:
+                fundamental_score += 1.2
+            elif roe >= 5.0:
+                fundamental_score += 0.3
+            else:
+                fundamental_score -= 1.5
+
+        # 净利润增速 YoY：成长性
+        if net_profit_yoy is not None:
+            if net_profit_yoy >= 30.0:
+                fundamental_score += 3.0
+            elif net_profit_yoy >= 10.0:
+                fundamental_score += 1.5
+            elif net_profit_yoy >= 0.0:
+                fundamental_score += 0.3
+            else:
+                fundamental_score -= 2.0
+
+        # 毛利率：护城河代理指标
+        if gross_margin is not None:
+            if gross_margin >= 40.0:
+                fundamental_score += 2.0
+            elif gross_margin >= 20.0:
+                fundamental_score += 0.8
+            elif gross_margin < 10.0:
+                fundamental_score -= 1.0
+
+        # 资产负债率：财务风险
+        if debt_ratio is not None:
+            if debt_ratio < 40.0:
+                fundamental_score += 1.0
+            elif debt_ratio > 70.0:
+                fundamental_score -= 2.0
+
+        fundamental_score = _clamp(fundamental_score, -6.5, 8.5)
+
+    # capital_flow_score：资金流向评分（仅 CN 市场 A 股）
+    # 数据降级：无数据时为 0，不阻断评分
+    capital_flow_score = 0.0
+    cf_data = capital_flow if isinstance(capital_flow, dict) else {}
+    if cf_data and not cf_data.get("error"):
+        main_pct = _safe_float(cf_data.get("main_net_inflow_pct"))
+        super_inflow = _safe_float(cf_data.get("super_net_inflow"))
+        main_inflow = _safe_float(cf_data.get("main_net_inflow"))
+        main_net_5d = _safe_float(cf_data.get("main_net_5d"))
+
+        # 主力净流入占比（主要信号）
+        if main_pct is not None:
+            if main_pct >= 3.0:
+                capital_flow_score += 3.5   # 大幅主力流入
+            elif main_pct >= 1.0:
+                capital_flow_score += 1.8   # 适度主力流入
+            elif main_pct >= -1.0:
+                capital_flow_score += 0.0   # 中性
+            elif main_pct >= -3.0:
+                capital_flow_score -= 1.2   # 轻微流出
+            else:
+                capital_flow_score -= 2.5   # 主力大幅流出
+
+        # 超大单净流入（机构资金代理）
+        # 用与主力净流入的比例关系：超大单为正且占主力50%+
+        if super_inflow is not None and main_inflow is not None and main_inflow > 0:
+            super_ratio = super_inflow / max(abs(main_inflow), 1.0)
+            if super_ratio >= 0.5:
+                capital_flow_score += 2.0   # 超大单为主导（机构买入）
+            elif super_ratio >= 0.2:
+                capital_flow_score += 0.8
+        elif super_inflow is not None and main_inflow is not None and main_inflow < 0 and super_inflow < 0:
+            capital_flow_score -= 1.5       # 超大单主导流出
+
+        # 5日趋势：连续流入更可靠
+        if main_net_5d is not None and main_inflow is not None and main_inflow > 0 and main_net_5d > 0:
+            capital_flow_score += 1.5       # 5日趋势与当日一致
+        elif main_net_5d is not None and main_net_5d < 0 and main_inflow is not None and main_inflow < 0:
+            capital_flow_score -= 1.0       # 持续流出
+
+        capital_flow_score = _clamp(capital_flow_score, -5.0, 7.0)
 
     source_bonus = 0.0
     # 来源加成：经 AI Agent 确认的信号质量更高
@@ -1059,7 +1152,7 @@ def _compute_factor_breakdown(
     regime_multiplier += _clamp((regime_confidence - 0.5) * 0.06, -0.03, 0.03)
     regime_multiplier = _clamp(regime_multiplier, 0.85, 1.12)
 
-    raw_score = base_score + alpha_score + catalyst_score + quality_score + source_bonus
+    raw_score = base_score + alpha_score + catalyst_score + fundamental_score + capital_flow_score + quality_score + source_bonus
     raw_score -= risk_penalty
     raw_score -= crowd_penalty
     has_entry = row.entry_low is not None or row.entry_high is not None
@@ -1081,6 +1174,8 @@ def _compute_factor_breakdown(
         "base_score": round(base_score, 4),
         "alpha_score": round(alpha_score, 4),
         "catalyst_score": round(catalyst_score, 4),
+        "fundamental_score": round(fundamental_score, 4),
+        "capital_flow_score": round(capital_flow_score, 4),
         "quality_score": round(quality_score, 4),
         "risk_penalty": round(risk_penalty, 4),
         "crowd_penalty": round(crowd_penalty, 4),
@@ -1422,6 +1517,46 @@ def refresh_strategy_signals(
             lookback_hours=72,
             max_rows=5000,
         )
+
+        # 批量采集基本面数据（仅 CN 市场，24h TTL 缓存，失败时静默降级）
+        fundamental_map: dict[str, dict] = {}
+        capital_flow_map: dict[str, dict] = {}
+        cn_symbols = list({
+            (c.stock_symbol or "").strip().upper()
+            for c in candidates
+            if (c.stock_market or "CN").strip().upper() == "CN"
+            and (c.stock_symbol or "").strip()
+        })
+        if cn_symbols:
+            try:
+                from src.collectors.fundamental_collector import FundamentalCollector
+                _fc = FundamentalCollector()
+                for sym in cn_symbols:
+                    try:
+                        result = _fc.get_fundamental_summary(sym)
+                        if result and not result.get("error"):
+                            fundamental_map[sym] = result
+                    except Exception:
+                        pass
+                logger.info("[策略层] 基本面数据采集完成: cn_symbols=%d, success=%d", len(cn_symbols), len(fundamental_map))
+            except Exception as e:
+                logger.warning("[策略层] 基本面采集初始化失败（降级跳过）: %s", e)
+
+            try:
+                from src.collectors.capital_flow_collector import CapitalFlowCollector
+                from src.models.market import MarketCode as _MC
+                _cfc = CapitalFlowCollector(_MC.CN)
+                for sym in cn_symbols:
+                    try:
+                        result = _cfc.get_capital_flow_summary(sym)
+                        if result and not result.get("error"):
+                            capital_flow_map[sym] = result
+                    except Exception:
+                        pass
+                logger.info("[策略层] 资金流向数据采集完成: cn_symbols=%d, success=%d", len(cn_symbols), len(capital_flow_map))
+            except Exception as e:
+                logger.warning("[策略层] 资金流向采集初始化失败（降级跳过）: %s", e)
+
         existing_rows = (
             db.query(StrategySignalRun)
             .filter(StrategySignalRun.snapshot_date == snapshot)
@@ -1485,6 +1620,8 @@ def refresh_strategy_signals(
                     news_metric=normalized_news_metric,
                     strategy_win_rate=win_rate_cache.get((code, market))
                     or win_rate_cache.get((code, "ALL")),
+                    fundamental=fundamental_map.get(symbol_key),
+                    capital_flow=capital_flow_map.get(symbol_key),
                 )
                 rank_score = float(score_breakdown.get("weighted_score") or 0.0)
                 confidence = c.confidence if c.confidence is not None else round(rank_score / 100.0, 3)

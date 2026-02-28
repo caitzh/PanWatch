@@ -625,66 +625,89 @@ def _pick_close_on_or_before(klines: list, target: date) -> float | None:
 
 
 def _derive_market_scan_decision(quote: dict | None, kline: dict | None) -> dict:
+    """根据行情和K线数据推导市场扫描决策。
+
+    使用连续浮点评分代替整数积分，各信号权重不同：
+      - 多头排列：+2.5 / 空头排列：-2.5
+      - MACD金叉（5日内）：+2.0 / 死叉（5日内）：-1.5
+      - 健康放量（1.5x~4.0x）：+1.2
+      - 价格动量（+1.5%~+8.5%）：+1.0
+      - 超跌反弹（<=-5.5%）：+0.8
+      - 临近支撑位：+0.8
+
+    决策阈值：
+      score >= 4.0 → buy | score >= 2.5 → add | score <= -3.0 → avoid | 其余 → watch
+    """
     q = quote or {}
     k = kline or {}
-    points = 0
+    score = 0.0
     tags: list[str] = []
     reasons: list[str] = []
 
+    # 均线排列（最高权重，趋势核心指标）
     trend = (k.get("trend") or "").strip()
     if trend == "多头排列":
-        points += 2
+        score += 2.5
         tags.append("trend_follow")
         reasons.append("均线多头排列")
     elif trend == "空头排列":
-        points -= 2
+        score -= 2.5
 
+    # MACD金叉/死叉（高权重技术信号）
+    # 若有 macd_cross_days 字段则限定为5日内，否则只要发生即计分
     macd = (k.get("macd_cross") or "").strip()
+    macd_days = _safe_float(k.get("macd_cross_days"))
     if macd == "金叉":
-        points += 2
-        tags.append("macd_golden")
-        reasons.append("MACD金叉")
+        if macd_days is None or macd_days <= 5:
+            score += 2.0
+            tags.append("macd_golden")
+            reasons.append("MACD金叉" + (f"({int(macd_days)}日内)" if macd_days is not None else ""))
     elif macd == "死叉":
-        points -= 2
+        if macd_days is None or macd_days <= 5:
+            score -= 1.5
 
+    # 成交量（健康放量区间 1.5x~4.0x）
     vol_ratio = _safe_float(k.get("volume_ratio"))
     if vol_ratio is not None:
-        if vol_ratio >= 1.8:
-            points += 1
+        if 1.5 <= vol_ratio <= 4.0:
+            score += 1.2
             tags.append("volume_breakout")
             reasons.append(f"放量({vol_ratio:.1f}x)")
         elif vol_ratio <= 0.7:
-            points -= 1
+            score -= 0.5
 
+    # 价格动量与反弹
     pct = _safe_float(q.get("change_pct"))
     if pct is not None:
         if 1.5 <= pct <= 8.5:
-            points += 1
+            score += 1.0
             tags.append("momentum")
             reasons.append(f"涨幅{pct:+.2f}%")
         elif pct >= 10.5:
-            points -= 2
+            score -= 1.5
         elif pct <= -5.5:
-            points += 1
+            score += 0.8
             tags.append("rebound")
             reasons.append("短线超跌")
 
+    # 临近支撑位
     support = _safe_float(k.get("support_m")) or _safe_float(k.get("support"))
     last_close = _safe_float(k.get("last_close")) or _safe_float(q.get("current_price"))
     if support and last_close and 0 < support < last_close <= support * 1.03:
-        points += 1
+        score += 0.8
         tags.append("pullback")
         reasons.append("回踩支撑附近")
 
+    # 决策阈值
     action = "watch"
     action_label = "观望"
-    if points >= 4:
+    if score >= 4.0:
         action = "buy"
         action_label = "建仓"
-    elif points >= 3:
+    elif score >= 2.5:
         action = "add"
         action_label = "准备加仓"
-    elif points <= -3:
+    elif score <= -3.0:
         action = "avoid"
         action_label = "回避"
 
@@ -696,7 +719,7 @@ def _derive_market_scan_decision(quote: dict | None, kline: dict | None) -> dict
         "signal": signal,
         "reason": reason,
         "strategy_tags": tags,
-        "points": points,
+        "points": score,  # 保留 points 字段名以兼容调用方，值为浮点分数
     }
 
 
@@ -725,11 +748,23 @@ def _score_market_scan_candidate(
 
     turnover = _safe_float(q.get("turnover"))
     if turnover is not None:
-        if turnover >= 3e9:
-            score += 3
-            evidence.append("成交额高")
-        elif turnover >= 1e9:
-            score += 1
+        avg_turnover_20d = _safe_float(q.get("avg_turnover_20d"))
+        if avg_turnover_20d and avg_turnover_20d > 0:
+            # 相对化评分：以20日均成交额为基准
+            ratio = turnover / avg_turnover_20d
+            if ratio >= 2.0:
+                score += 3
+                evidence.append(f"成交额活跃({ratio:.1f}x均值)")
+            elif ratio >= 1.2:
+                score += 1
+                evidence.append(f"成交额适度活跃({ratio:.1f}x均值)")
+        else:
+            # fallback：保留原有绝对值逻辑
+            if turnover >= 3e9:
+                score += 3
+                evidence.append("成交额高")
+            elif turnover >= 1e9:
+                score += 1
 
     trend = (k.get("trend") or "").strip()
     if trend == "多头排列":
