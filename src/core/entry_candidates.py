@@ -1738,6 +1738,7 @@ def evaluate_entry_candidate_outcomes(
             .filter(
                 EntryCandidate.status == "active",
                 EntryCandidate.snapshot_date >= cutoff.strftime("%Y-%m-%d"),
+                EntryCandidate.stock_market.in_(list(_ACTIVE_MARKETS)),  # 只评估已启用市场
             )
             .order_by(EntryCandidate.snapshot_date.desc(), EntryCandidate.score.desc())
             .limit(max(1, int(limit)))

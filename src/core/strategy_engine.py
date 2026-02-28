@@ -1885,12 +1885,14 @@ def evaluate_strategy_outcomes(
     db = SessionLocal()
     try:
         cutoff = date.today() - timedelta(days=max(7, int(snapshot_days)))
+        from src.core.entry_candidates import _ACTIVE_MARKETS as _SE_ACTIVE_MARKETS
         signals = (
             db.query(StrategySignalRun)
             .filter(
                 StrategySignalRun.snapshot_date >= cutoff.strftime("%Y-%m-%d"),
                 StrategySignalRun.status.in_(("active", "inactive")),
                 StrategySignalRun.action.in_(("buy", "add", "hold", "watch")),
+                StrategySignalRun.stock_market.in_(list(_SE_ACTIVE_MARKETS)),  # 只评估已启用市场
             )
             .order_by(StrategySignalRun.snapshot_date.desc(), StrategySignalRun.rank_score.desc())
             .limit(max(1, int(limit)))
