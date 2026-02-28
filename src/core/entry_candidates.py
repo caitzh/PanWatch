@@ -54,6 +54,10 @@ CANDIDATE_SOURCE_LABELS: dict[str, str] = {
     "mixed": "市场+关注",
 }
 
+# 当前启用的市场，暂时只处理 A 股，节省采集和评分时间
+# 如需启用港股/美股，在此添加 "HK" / "US"
+_ACTIVE_MARKETS: frozenset[str] = frozenset({"CN"})
+
 
 STRATEGY_LABELS: dict[str, str] = {
     "trend_follow": "趋势延续",
@@ -1021,6 +1025,8 @@ def _load_market_scan_inputs(limit_per_market: int = 60) -> dict[str, dict]:
     min_required = min(max(12, int(safe_limit * 0.55)), safe_limit)
 
     for market in ("CN", "HK", "US"):
+        if market not in _ACTIVE_MARKETS:
+            continue  # 跳过未启用市场，减少采集时间
         try:
             turnover = _run_async(
                 collector.fetch_hot_stocks(
@@ -1302,6 +1308,8 @@ def refresh_entry_candidates(
     input_map: dict[str, dict] = dict(market_scan_map)
     for s in suggestions:
         market = _to_market(s.stock_market).value
+        if market not in _ACTIVE_MARKETS:
+            continue  # 跳过未启用市场的 AI 建议
         symbol = (s.stock_symbol or "").strip()
         if not symbol:
             continue
