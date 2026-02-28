@@ -1,6 +1,20 @@
-"""资金流向采集器 - 基于东方财富 API"""
+"""资金流向采集器
+
+数据来源（按优先级）：
+  1. SQLite 持久化缓存（当日有效，次日自动失效）
+  2. AKShare stock_individual_fund_flow（东方财富，非交易时间也能返回历史数据）
+  3. 降级：直接调东方财富 HTTP API（push2his，原有逻辑）
+  4. 最终降级：返回 {"error": "..."}
+
+缓存策略：
+- 资金流向按交易日更新，缓存有效期到次日 05:00（UTC）
+- 进程内二级缓存（5分钟），避免同一批次重复查库
+"""
 import logging
+import time
 from dataclasses import dataclass
+from datetime import datetime, timedelta
+from typing import ClassVar
 
 import httpx
 
@@ -9,27 +23,19 @@ from src.models.market import MarketCode
 
 logger = logging.getLogger(__name__)
 
-# 东方财富资金流向 API（fflow 接口）
-# push2: 实时数据（仅当日），push2his: 历史数据（含当日）
+# 东方财富历史资金流向 API（直接 HTTP，备用）
 EASTMONEY_FLOW_URL = "https://push2his.eastmoney.com/api/qt/stock/fflow/kline/get"
 
+# 缓存有效期
+_MEM_TTL_SEC = 300       # 进程内二级缓存 5 分钟
 
-@dataclass
-class CapitalFlow:
-    """资金流向数据"""
-    symbol: str
-    name: str
 
-    # 今日资金流（单位：元）
-    main_net_inflow: float      # 主力净流入（大单+超大单）
-    main_net_inflow_pct: float  # 主力净流入占比（估算）
-    super_net_inflow: float     # 超大单净流入
-    big_net_inflow: float       # 大单净流入
-    mid_net_inflow: float       # 中单净流入
-    small_net_inflow: float     # 小单净流入
-
-    # 5日资金流
-    main_net_5d: float | None = None  # 5日主力净流入
+def _cache_expire_time() -> datetime:
+    """计算缓存过期时间：次日 05:00 UTC（北京时间 13:00，收盘后充足冗余）"""
+    now = datetime.utcnow()
+    # 明天 05:00 UTC
+    tomorrow = now.date() + timedelta(days=1)
+    return datetime(tomorrow.year, tomorrow.month, tomorrow.day, 5, 0, 0)
 
 
 def _get_eastmoney_secid(symbol: str, market: MarketCode) -> str:
@@ -42,18 +48,212 @@ def _get_eastmoney_secid(symbol: str, market: MarketCode) -> str:
     return f"{prefix}.{symbol}"
 
 
+def _get_db_session():
+    """获取数据库 Session（延迟导入，避免循环依赖）"""
+    from src.web.database import SessionLocal
+    return SessionLocal()
+
+
+def _read_db_cache(symbol: str) -> dict | None:
+    """从 SQLite 读取未过期的资金流向缓存"""
+    try:
+        from src.web.models import MarketDataCache
+        db = _get_db_session()
+        try:
+            row = (
+                db.query(MarketDataCache)
+                .filter(
+                    MarketDataCache.symbol == symbol,
+                    MarketDataCache.data_type == "capital_flow",
+                    MarketDataCache.expires_at > datetime.utcnow(),
+                )
+                .first()
+            )
+            if row:
+                return row.data
+        finally:
+            db.close()
+    except Exception as e:
+        logger.debug("资金流向缓存读取失败: %s", e)
+    return None
+
+
+def _write_db_cache(symbol: str, data: dict) -> None:
+    """将资金流向数据写入 SQLite 缓存"""
+    try:
+        from src.web.models import MarketDataCache
+        db = _get_db_session()
+        try:
+            now = datetime.utcnow()
+            expires = _cache_expire_time()
+            row = (
+                db.query(MarketDataCache)
+                .filter(
+                    MarketDataCache.symbol == symbol,
+                    MarketDataCache.data_type == "capital_flow",
+                )
+                .first()
+            )
+            if row:
+                row.data = data
+                row.fetched_at = now
+                row.expires_at = expires
+            else:
+                row = MarketDataCache(
+                    symbol=symbol,
+                    data_type="capital_flow",
+                    data=data,
+                    fetched_at=now,
+                    expires_at=expires,
+                )
+                db.add(row)
+            db.commit()
+        finally:
+            db.close()
+    except Exception as e:
+        logger.debug("资金流向缓存写入失败: %s", e)
+
+
+@dataclass
+class CapitalFlow:
+    """资金流向数据（内部使用）"""
+    symbol: str
+    name: str
+    main_net_inflow: float
+    main_net_inflow_pct: float
+    super_net_inflow: float
+    big_net_inflow: float
+    mid_net_inflow: float
+    small_net_inflow: float
+    main_net_5d: float | None = None
+
+
 class CapitalFlowCollector:
-    """资金流向采集器"""
+    """资金流向采集器（双层缓存：进程内5分钟 + SQLite 次日失效）"""
+
+    # 进程内二级缓存：symbol -> (timestamp, summary_dict)
+    _mem_cache: ClassVar[dict[str, tuple[float, dict]]] = {}
 
     def __init__(self, market: MarketCode):
         self.market = market
 
-    def get_capital_flow(self, symbol: str) -> CapitalFlow | None:
-        """获取单只股票的资金流向"""
-        secid = _get_eastmoney_secid(symbol, self.market)
+    def get_capital_flow_summary(self, symbol: str) -> dict:
+        """
+        获取资金流向摘要（带双层缓存）。
 
-        # 使用 fflow API 获取资金流向
-        # klt=101 表示日线，lmt=5 表示最近5天
+        缓存查找顺序：
+          1. 进程内缓存（5分钟）
+          2. SQLite 持久化缓存（当日有效）
+          3. AKShare 实时采集
+          4. 东方财富直接 HTTP 降级
+
+        返回格式：
+        {
+            "status": "主力明显流入",
+            "main_net_inflow": 1.2e8,
+            "main_net_inflow_pct": 6.5,
+            "super_net_inflow": 5.0e7,
+            "big_net_inflow": 7.0e7,
+            "mid_net_inflow": -3.0e7,
+            "small_net_inflow": -2.0e7,
+            "trend_5d": "5日净流入2.30亿",
+            "cached": True,
+        }
+        """
+        now = time.time()
+
+        # 1. 进程内缓存
+        if symbol in self._mem_cache:
+            ts, data = self._mem_cache[symbol]
+            if now - ts < _MEM_TTL_SEC:
+                return data
+
+        # 2. SQLite 持久化缓存
+        cached = _read_db_cache(symbol)
+        if cached and not cached.get("error"):
+            cached["cached"] = True
+            self._mem_cache[symbol] = (now, cached)
+            return cached
+
+        # 3. AKShare 采集（仅 A 股）
+        if self.market == MarketCode.CN:
+            result = self._fetch_from_akshare(symbol)
+            if not result.get("error"):
+                self._mem_cache[symbol] = (now, result)
+                _write_db_cache(symbol, result)
+                return result
+
+        # 4. 东方财富直接 HTTP 降级（原有逻辑）
+        result = self._fetch_from_eastmoney(symbol)
+        if not result.get("error"):
+            self._mem_cache[symbol] = (now, result)
+            _write_db_cache(symbol, result)
+
+        return result
+
+    def _fetch_from_akshare(self, symbol: str) -> dict:
+        """通过 AKShare stock_individual_fund_flow 采集，非交易时间也有历史数据"""
+        try:
+            import akshare as ak
+
+            # 判断市场前缀（AKShare 需要 "sh"/"sz"/"bj"）
+            if is_cn_sh(symbol):
+                market_str = "sh"
+            elif symbol.startswith(("43", "83", "87", "88", "92", "920")):
+                market_str = "bj"
+            else:
+                market_str = "sz"
+
+            df = ak.stock_individual_fund_flow(stock=symbol, market=market_str)
+            if df is None or df.empty:
+                return {"error": "AKShare 无资金流向数据"}
+
+            # 取最新一行（按日期倒序或正序，取最后一行）
+            latest = df.iloc[-1]
+
+            # 字段名参考 AKShare 文档（列名可能含空格，strip 处理）
+            col_map = {c.strip(): c for c in df.columns}
+
+            def _get(name: str) -> float | None:
+                col = col_map.get(name)
+                if col is None:
+                    return None
+                return _safe_float(latest.get(col))
+
+            main_net = _get("主力净流入-净额") or _get("主力净流入净额") or 0.0
+            super_net = _get("超大单净流入-净额") or _get("超大单净流入净额") or 0.0
+            big_net = _get("大单净流入-净额") or _get("大单净流入净额") or 0.0
+            mid_net = _get("中单净流入-净额") or _get("中单净流入净额") or 0.0
+            small_net = _get("小单净流入-净额") or _get("小单净流入净额") or 0.0
+
+            # 主力净流入占比
+            total_flow = abs(main_net) + abs(mid_net) + abs(small_net)
+            main_pct = (main_net / total_flow * 100) if total_flow > 0 else 0.0
+
+            # 近 5 日主力净流入合计
+            n = min(5, len(df))
+            main_5d_col = col_map.get("主力净流入-净额") or col_map.get("主力净流入净额")
+            main_net_5d = float(df[main_5d_col].tail(n).sum()) if main_5d_col else None
+
+            summary = _build_summary(
+                main_net_inflow=main_net,
+                main_net_inflow_pct=main_pct,
+                super_net_inflow=super_net,
+                big_net_inflow=big_net,
+                mid_net_inflow=mid_net,
+                small_net_inflow=small_net,
+                main_net_5d=main_net_5d,
+            )
+            summary["cached"] = False
+            return summary
+
+        except Exception as e:
+            logger.debug("AKShare 资金流向采集失败 %s: %s", symbol, e)
+            return {"error": str(e)}
+
+    def _fetch_from_eastmoney(self, symbol: str) -> dict:
+        """直接调东方财富 HTTP API（原有逻辑，作为降级）"""
+        secid = _get_eastmoney_secid(symbol, self.market)
         params = {
             "secid": secid,
             "klt": "101",
@@ -61,110 +261,121 @@ class CapitalFlowCollector:
             "fields1": "f1,f2,f3,f7",
             "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61,f62,f63",
         }
-
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
             "Referer": "https://quote.eastmoney.com/",
         }
-
         try:
             with httpx.Client(follow_redirects=True, timeout=4) as client:
                 resp = client.get(EASTMONEY_FLOW_URL, params=params, headers=headers)
                 data = resp.json()
 
-            if data.get("data") is None or data["data"].get("klines") is None:
-                logger.warning(f"获取 {symbol} 资金流向失败: 无数据")
-                return None
+            if data.get("data") is None or not data["data"].get("klines"):
+                return {"error": "东方财富无资金流向数据"}
 
             klines = data["data"]["klines"]
-            if not klines:
-                logger.warning(f"获取 {symbol} 资金流向失败: klines 为空")
-                return None
-
-            name = data["data"].get("name", "")
-
-            # 解析最近一天的数据（klines 按时间从旧到新排序，取最后一条）
-            # 格式: 日期,主力净流入,小单净流入,中单净流入,大单净流入,超大单净流入
             today_parts = klines[-1].split(",")
             if len(today_parts) < 6:
-                logger.warning(f"获取 {symbol} 资金流向失败: 数据格式错误")
-                return None
+                return {"error": "东方财富数据格式错误"}
 
-            main_net_inflow = float(today_parts[1])      # 主力净流入
-            small_net_inflow = float(today_parts[2])     # 小单净流入
-            mid_net_inflow = float(today_parts[3])       # 中单净流入
-            big_net_inflow = float(today_parts[4])       # 大单净流入
-            super_net_inflow = float(today_parts[5])     # 超大单净流入
+            main_net = float(today_parts[1])
+            small_net = float(today_parts[2])
+            mid_net = float(today_parts[3])
+            big_net = float(today_parts[4])
+            super_net = float(today_parts[5])
 
-            # 计算主力净流入占比（基于总成交额的估算）
-            # 主力净流入占比 = 主力净流入 / (|主力净流入| + |中单净流入| + |小单净流入|) * 100
-            total_flow = abs(main_net_inflow) + abs(mid_net_inflow) + abs(small_net_inflow)
-            if total_flow > 0:
-                main_net_inflow_pct = main_net_inflow / total_flow * 100
-            else:
-                main_net_inflow_pct = 0
+            total_flow = abs(main_net) + abs(mid_net) + abs(small_net)
+            main_pct = (main_net / total_flow * 100) if total_flow > 0 else 0.0
+            main_5d = sum(float(k.split(",")[1]) for k in klines)
 
-            # 计算5日主力净流入
-            main_net_5d = None
-            if len(klines) >= 1:
-                main_net_5d = sum(float(k.split(",")[1]) for k in klines)
-
-            return CapitalFlow(
-                symbol=symbol,
-                name=name,
-                main_net_inflow=main_net_inflow,
-                main_net_inflow_pct=main_net_inflow_pct,
-                super_net_inflow=super_net_inflow,
-                big_net_inflow=big_net_inflow,
-                mid_net_inflow=mid_net_inflow,
-                small_net_inflow=small_net_inflow,
-                main_net_5d=main_net_5d,
+            summary = _build_summary(
+                main_net_inflow=main_net,
+                main_net_inflow_pct=main_pct,
+                super_net_inflow=super_net,
+                big_net_inflow=big_net,
+                mid_net_inflow=mid_net,
+                small_net_inflow=small_net,
+                main_net_5d=main_5d,
             )
+            summary["cached"] = False
+            return summary
 
         except Exception as e:
-            logger.error(f"获取 {symbol} 资金流向失败: {e}")
+            logger.error("东方财富资金流向采集失败 %s: %s", symbol, e)
+            return {"error": str(e)}
+
+    # 保留向后兼容的方法
+    def get_capital_flow(self, symbol: str) -> CapitalFlow | None:
+        """向后兼容接口，内部直接调 get_capital_flow_summary"""
+        summary = self.get_capital_flow_summary(symbol)
+        if summary.get("error"):
             return None
+        return CapitalFlow(
+            symbol=symbol,
+            name="",
+            main_net_inflow=summary.get("main_net_inflow", 0),
+            main_net_inflow_pct=summary.get("main_net_inflow_pct", 0),
+            super_net_inflow=summary.get("super_net_inflow", 0),
+            big_net_inflow=summary.get("big_net_inflow", 0),
+            mid_net_inflow=summary.get("mid_net_inflow", 0),
+            small_net_inflow=summary.get("small_net_inflow", 0),
+            main_net_5d=None,
+        )
 
-    def get_capital_flow_summary(self, symbol: str) -> dict:
-        """获取资金流向摘要（用于 prompt）"""
-        flow = self.get_capital_flow(symbol)
 
-        if not flow:
-            return {"error": "无资金流向数据"}
-
-        # 判断资金状态
-        if flow.main_net_inflow > 0:
-            if flow.main_net_inflow_pct > 10:
-                status = "主力大幅流入"
-            elif flow.main_net_inflow_pct > 5:
-                status = "主力明显流入"
-            else:
-                status = "主力小幅流入"
-        elif flow.main_net_inflow < 0:
-            if flow.main_net_inflow_pct < -10:
-                status = "主力大幅流出"
-            elif flow.main_net_inflow_pct < -5:
-                status = "主力明显流出"
-            else:
-                status = "主力小幅流出"
+def _build_summary(
+    *,
+    main_net_inflow: float,
+    main_net_inflow_pct: float,
+    super_net_inflow: float,
+    big_net_inflow: float,
+    mid_net_inflow: float,
+    small_net_inflow: float,
+    main_net_5d: float | None,
+) -> dict:
+    """根据数值构建摘要 dict（复用逻辑）"""
+    if main_net_inflow > 0:
+        if main_net_inflow_pct > 10:
+            status = "主力大幅流入"
+        elif main_net_inflow_pct > 5:
+            status = "主力明显流入"
         else:
-            status = "主力资金平衡"
+            status = "主力小幅流入"
+    elif main_net_inflow < 0:
+        if main_net_inflow_pct < -10:
+            status = "主力大幅流出"
+        elif main_net_inflow_pct < -5:
+            status = "主力明显流出"
+        else:
+            status = "主力小幅流出"
+    else:
+        status = "主力资金平衡"
 
-        # 5日趋势
-        trend_5d = "无数据"
-        if flow.main_net_5d is not None:
-            if flow.main_net_5d > 0:
-                trend_5d = f"5日净流入{flow.main_net_5d/1e8:.2f}亿"
-            else:
-                trend_5d = f"5日净流出{abs(flow.main_net_5d)/1e8:.2f}亿"
+    trend_5d = "无数据"
+    if main_net_5d is not None:
+        if main_net_5d > 0:
+            trend_5d = f"5日净流入{main_net_5d / 1e8:.2f}亿"
+        else:
+            trend_5d = f"5日净流出{abs(main_net_5d) / 1e8:.2f}亿"
 
-        return {
-            "status": status,
-            "main_net_inflow": flow.main_net_inflow,
-            "main_net_inflow_pct": flow.main_net_inflow_pct,
-            "super_net_inflow": flow.super_net_inflow,
-            "big_net_inflow": flow.big_net_inflow,
-            "mid_net_inflow": flow.mid_net_inflow,
-            "small_net_inflow": flow.small_net_inflow,
-            "trend_5d": trend_5d,
-        }
+    return {
+        "status": status,
+        "main_net_inflow": main_net_inflow,
+        "main_net_inflow_pct": main_net_inflow_pct,
+        "super_net_inflow": super_net_inflow,
+        "big_net_inflow": big_net_inflow,
+        "mid_net_inflow": mid_net_inflow,
+        "small_net_inflow": small_net_inflow,
+        "trend_5d": trend_5d,
+    }
+
+
+def _safe_float(value) -> float | None:
+    """安全转换为 float"""
+    try:
+        v = float(value)
+        if v != v:
+            return None
+        return v
+    except (TypeError, ValueError):
+        return None

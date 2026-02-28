@@ -668,6 +668,29 @@ class StrategySignalRun(Base):
     updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
 
 
+class MarketDataCache(Base):
+    """基本面 & 资金流向数据持久化缓存。
+
+    每条记录对应一只股票的一种数据类型（fundamental / capital_flow）。
+    采集成功后写入，后续读取时检查 expires_at，未过期直接复用。
+    """
+
+    __tablename__ = "market_data_cache"
+    __table_args__ = (
+        UniqueConstraint("symbol", "data_type", name="uq_market_data_cache_symbol_type"),
+        Index("ix_market_data_cache_expires", "expires_at"),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    symbol = Column(String, nullable=False)           # 股票代码，如 "600519"
+    data_type = Column(String, nullable=False)         # "fundamental" | "capital_flow"
+    data = Column(JSON, nullable=False, default={})    # 采集结果 dict
+    fetched_at = Column(DateTime, nullable=False)      # 实际采集时间
+    expires_at = Column(DateTime, nullable=False)      # 过期时间
+    created_at = Column(DateTime, server_default=func.now())
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
+
+
 class StrategyOutcome(Base):
     """策略后验结果。"""
 
