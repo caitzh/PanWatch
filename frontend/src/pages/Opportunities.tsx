@@ -45,6 +45,20 @@ const formatSignalTime = (iso?: string): string => {
   }
 }
 
+// 只取时分 HH:mm
+const formatSignalHHMM = (iso?: string): string => {
+  if (!iso) return ''
+  try {
+    const d = new Date(iso)
+    if (isNaN(d.getTime())) return ''
+    const h = String(d.getHours()).padStart(2, '0')
+    const m = String(d.getMinutes()).padStart(2, '0')
+    return `${h}:${m}`
+  } catch {
+    return ''
+  }
+}
+
 const marketLabel = (m?: string) => {
   if (m === 'HK') return '港股'
   if (m === 'US') return '美股'
@@ -361,15 +375,15 @@ export default function OpportunitiesPage() {
       }
       setItems(data.items || [])
       setSnapshotDate(data.snapshot_date || '')
-      // 取最新信号的 created_at 用于顶部时间显示
+      // 取最新信号的 created_at（信号生成时间，不用 updated_at 避免后验评估导致时间偏移）
       const items = data.items || []
       if (items.length > 0) {
         const latest = items.reduce((a: StrategySignalItem, b: StrategySignalItem) => {
-          const ta = Date.parse(a.updated_at || a.created_at || '')
-          const tb = Date.parse(b.updated_at || b.created_at || '')
+          const ta = Date.parse(a.created_at || '')
+          const tb = Date.parse(b.created_at || '')
           return tb > ta ? b : a
         })
-        setLatestCreatedAt(latest.updated_at || latest.created_at || '')
+        setLatestCreatedAt(latest.created_at || '')
       }
       if (!data.snapshot_date) {
         setError('暂无机会快照，请点击“刷新”生成一次')
@@ -557,7 +571,7 @@ export default function OpportunitiesPage() {
         </div>
         <div className="flex items-center gap-2">
           <span className="text-[11px] text-muted-foreground">
-            {snapshotDate ? `${snapshotDate}${latestCreatedAt ? ' ' + formatSignalTime(latestCreatedAt).slice(6) : ''}` : '最新快照'}
+            {snapshotDate ? `${snapshotDate}${latestCreatedAt ? ' ' + formatSignalHHMM(latestCreatedAt) : ''}` : '最新快照'}
           </span>
           <Button
             variant="secondary"
@@ -821,7 +835,7 @@ export default function OpportunitiesPage() {
                   来源: {sourceFlags.join(' + ')}
                 </div>
                 <div className="text-[10px] text-muted-foreground">
-                  {item.created_at ? `生成: ${formatSignalTime(item.created_at)}` : '评估: 自动后验'}
+                  {item.created_at ? `生成: ${formatSignalTime(item.created_at)}` : '--'}
                 </div>
               </div>
             </div>
