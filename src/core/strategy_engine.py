@@ -1381,6 +1381,8 @@ def _format_signal(
         raw_reasons = fp.get("constraint_reasons")
         constraint_reasons = raw_reasons if isinstance(raw_reasons, list) else []
         constrained = bool(fp.get("constrained"))
+        # 从 factor_payload 中提取完整的 score_breakdown（包含 fundamental/capital_flow）
+        fp_breakdown = fp.get("score_breakdown") if isinstance(fp.get("score_breakdown"), dict) else {}
         score_breakdown = {
             "alpha_score": round(float(getattr(factor_snapshot, "alpha_score", 0.0) or 0.0), 4),
             "catalyst_score": round(float(getattr(factor_snapshot, "catalyst_score", 0.0) or 0.0), 4),
@@ -1396,6 +1398,15 @@ def _format_signal(
                 4,
             ),
             "has_entry_plan": bool(row.entry_low is not None or row.entry_high is not None),
+            # 从 factor_payload 补全基本面和资金流分数（factor_payload 里存有完整 breakdown）
+            "fundamental_score": fp_breakdown.get("fundamental_score"),
+            "fundamental_available": fp_breakdown.get("fundamental_available"),
+            "capital_flow_score": fp_breakdown.get("capital_flow_score"),
+            "capital_flow_available": fp_breakdown.get("capital_flow_available"),
+            "base_score": fp_breakdown.get("base_score"),
+            "raw_score": fp_breakdown.get("raw_score"),
+            "regime": fp_breakdown.get("regime"),
+            "regime_label": fp_breakdown.get("regime_label"),
         }
     has_entry_plan = bool(
         row.entry_low is not None
