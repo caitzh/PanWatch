@@ -1545,15 +1545,32 @@ def refresh_strategy_signals(
             try:
                 from src.collectors.capital_flow_collector import CapitalFlowCollector
                 from src.models.market import MarketCode as _MC
+                import time as _time
                 _cfc = CapitalFlowCollector(_MC.CN)
+                _cf_start = _time.monotonic()
+                _cf_fail_streak = 0  # 连续失败计数
+                _CF_TIMEOUT_TOTAL = 30.0   # 总超时：30秒
+                _CF_FAIL_ABORT = 5         # 连续失败5次则放弃（API 不可用）
                 for sym in cn_symbols:
+                    # 超过总时间限制则退出
+                    if _time.monotonic() - _cf_start > _CF_TIMEOUT_TOTAL:
+                        logger.warning("[策略层] 资金流向采集超时，已跳过剩余 %d 只股票", len(cn_symbols) - len(capital_flow_map) - _cf_fail_streak)
+                        break
+                    # 连续失败达到阈值，推测 API 不可用，直接退出
+                    if _cf_fail_streak >= _CF_FAIL_ABORT:
+                        logger.warning("[策略层] 资金流向 API 疑似不可用（连续失败 %d 次），跳过剩余采集", _cf_fail_streak)
+                        break
                     try:
                         result = _cfc.get_capital_flow_summary(sym)
                         if result and not result.get("error"):
                             capital_flow_map[sym] = result
+                            _cf_fail_streak = 0  # 成功则重置连续失败计数
+                        else:
+                            _cf_fail_streak += 1
                     except Exception:
-                        pass
-                logger.info("[策略层] 资金流向数据采集完成: cn_symbols=%d, success=%d", len(cn_symbols), len(capital_flow_map))
+                        _cf_fail_streak += 1
+                logger.info("[策略层] 资金流向数据采集完成: cn_symbols=%d, success=%d, elapsed=%.1fs",
+                    len(cn_symbols), len(capital_flow_map), _time.monotonic() - _cf_start)
             except Exception as e:
                 logger.warning("[策略层] 资金流向采集初始化失败（降级跳过）: %s", e)
 

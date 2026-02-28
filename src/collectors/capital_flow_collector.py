@@ -68,7 +68,7 @@ class CapitalFlowCollector:
         }
 
         try:
-            with httpx.Client(follow_redirects=True, timeout=8) as client:
+            with httpx.Client(follow_redirects=True, timeout=4) as client:
                 resp = client.get(EASTMONEY_FLOW_URL, params=params, headers=headers)
                 data = resp.json()
 
