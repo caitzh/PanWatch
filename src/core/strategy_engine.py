@@ -1082,7 +1082,10 @@ def _compute_factor_breakdown(
     # 数据降级：无数据时为 0，不阻断评分
     capital_flow_score = 0.0
     cf_data = capital_flow if isinstance(capital_flow, dict) else {}
-    if cf_data and not cf_data.get("error"):
+    # 历史回填数据：直接使用存储的历史分数，跳过重算（避免用 0 值数据算出错误分数）
+    if cf_data.get("_stale") and cf_data.get("_stale_score") is not None:
+        capital_flow_score = float(cf_data["_stale_score"])
+    elif cf_data and not cf_data.get("error"):
         main_pct = _safe_float(cf_data.get("main_net_inflow_pct"))
         super_inflow = _safe_float(cf_data.get("super_net_inflow"))
         main_inflow = _safe_float(cf_data.get("main_net_inflow"))
@@ -1572,6 +1575,47 @@ def refresh_strategy_signals(
                     len(cn_symbols), len(capital_flow_map), _time.monotonic() - _cf_start)
             except Exception as e:
                 logger.warning("[策略层] 资金流向采集初始化失败（降级跳过）: %s", e)
+
+            # 对采集失败的股票，从 factor_payload 历史记录中回填（非交易日/接口断开时的降级）
+            missing = [s for s in cn_symbols if s not in capital_flow_map]
+            if missing:
+                try:
+                    from src.web.models import StrategyFactorSnapshot as _SFS, StrategySignalRun as _SSR
+                    cutoff_date = (datetime.utcnow().date() - timedelta(days=5)).isoformat()
+                    for sym in missing:
+                        # 取该股票最近一次有资金流数据的 factor_payload
+                        row_hist = (
+                            db.query(_SFS)
+                            .join(_SSR, _SSR.id == _SFS.signal_run_id)
+                            .filter(
+                                _SSR.stock_symbol == sym,
+                                _SSR.snapshot_date >= cutoff_date,
+                            )
+                            .order_by(_SSR.snapshot_date.desc(), _SFS.id.desc())
+                            .first()
+                        )
+                        if row_hist and isinstance(row_hist.factor_payload, dict):
+                            bd = row_hist.factor_payload.get("score_breakdown", {})
+                            cf_score = bd.get("capital_flow_score")
+                            cf_avail = bd.get("capital_flow_available")
+                            if cf_avail and cf_score is not None:
+                                # 重建资金流摘要（仅含评分所需字段，标记为历史数据）
+                                capital_flow_map[sym] = {
+                                    "main_net_inflow": 0.0,
+                                    "main_net_inflow_pct": 0.0,
+                                    "super_net_inflow": 0.0,
+                                    "big_net_inflow": 0.0,
+                                    "mid_net_inflow": 0.0,
+                                    "small_net_inflow": 0.0,
+                                    "main_net_5d": None,
+                                    "_stale": True,  # 标记为历史数据，不写入实时缓存
+                                    "_stale_score": cf_score,  # 直接复用历史分数
+                                }
+                    stale_count = sum(1 for v in capital_flow_map.values() if isinstance(v, dict) and v.get("_stale"))
+                    if stale_count:
+                        logger.info("[策略层] 资金流向历史回填: stale=%d/%d", stale_count, len(missing))
+                except Exception as e:
+                    logger.debug("[策略层] 资金流向历史回填失败（降级跳过）: %s", e)
 
         existing_rows = (
             db.query(StrategySignalRun)

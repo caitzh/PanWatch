@@ -31,10 +31,18 @@ _MEM_TTL_SEC = 300       # 进程内二级缓存 5 分钟
 
 
 def _cache_expire_time() -> datetime:
-    """计算缓存过期时间：次日 05:00 UTC（北京时间 13:00，收盘后充足冗余）"""
+    """计算缓存过期时间：下一个工作日 05:00 UTC（北京时间 13:00）
+
+    周五采集的数据延期到周一，确保周末也能读到上一交易日的资金流数据。
+    """
     now = datetime.utcnow()
-    # 明天 05:00 UTC
     tomorrow = now.date() + timedelta(days=1)
+    # 如果明天是周六(5)，跳到周一；如果明天是周日(6)，跳到周一
+    weekday = tomorrow.weekday()  # 0=周一 ... 6=周日
+    if weekday == 5:   # 周六 → 跳到周一（+2天）
+        tomorrow += timedelta(days=2)
+    elif weekday == 6:  # 周日 → 跳到周一（+1天）
+        tomorrow += timedelta(days=1)
     return datetime(tomorrow.year, tomorrow.month, tomorrow.day, 5, 0, 0)
 
 
@@ -55,22 +63,47 @@ def _get_db_session():
 
 
 def _read_db_cache(symbol: str) -> dict | None:
-    """从 SQLite 读取未过期的资金流向缓存"""
+    """从 SQLite 读取资金流向缓存。
+
+    查找顺序：
+    1. 未过期的当前缓存
+    2. 最近 5 天内的历史缓存（跨日降级，用于周末/非交易日）
+    """
     try:
         from src.web.models import MarketDataCache
         db = _get_db_session()
         try:
+            now = datetime.utcnow()
+            # 1. 优先读未过期缓存
             row = (
                 db.query(MarketDataCache)
                 .filter(
                     MarketDataCache.symbol == symbol,
                     MarketDataCache.data_type == "capital_flow",
-                    MarketDataCache.expires_at > datetime.utcnow(),
+                    MarketDataCache.expires_at > now,
                 )
                 .first()
             )
             if row:
                 return row.data
+            # 2. 降级：读最近 5 天内的历史缓存（非交易日/采集失败时使用上一交易日数据）
+            cutoff = now - timedelta(days=5)
+            row = (
+                db.query(MarketDataCache)
+                .filter(
+                    MarketDataCache.symbol == symbol,
+                    MarketDataCache.data_type == "capital_flow",
+                    MarketDataCache.fetched_at > cutoff,
+                )
+                .order_by(MarketDataCache.fetched_at.desc())
+                .first()
+            )
+            if row:
+                logger.debug("资金流向使用历史缓存 %s（采集于 %s）", symbol, row.fetched_at)
+                data = dict(row.data) if isinstance(row.data, dict) else row.data
+                if isinstance(data, dict):
+                    data["stale"] = True   # 标记为过期数据，调用方可选择忽略
+                return data
         finally:
             db.close()
     except Exception as e:
