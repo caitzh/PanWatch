@@ -391,6 +391,72 @@ def _classify_market_regime(
     return regime, round(score, 4), round(confidence, 4)
 
 
+def _fetch_index_regime_data(market: str) -> dict | None:
+    """通过全市场指数 K 线估算市场状态（无选择偏差）。
+
+    A 股 (CN) 优先拉取沪深300 (000300)，备选上证指数 (000001)。
+    计算近 20 个交易日的日均涨幅、上涨天数占比和波动率，用于替代
+    候选股票样本估计市场状态，消除选择偏差。
+
+    Returns:
+        包含 breadth_up_pct / avg_change_pct / volatility_pct 的字典，
+        或 None（网络异常 / 数据不足时降级）。
+    """
+    # 目前只支持 A 股市场；其他市场保留候选样本逻辑
+    if market.upper() != "CN":
+        return None
+
+    # 候选指数：沪深300 优先，上证指数备选
+    # A 股指数通过 MarketCode.CN 访问（腾讯 API 使用 sh 前缀）
+    index_candidates = [
+        ("000300", MarketCode.CN),  # 沪深300 —— 代表性最强
+        ("000001", MarketCode.CN),  # 上证指数 —— 备选
+    ]
+
+    for symbol, mkt_code in index_candidates:
+        try:
+            collector = KlineCollector(mkt_code)
+            klines = collector.get_klines(symbol, days=25)  # 多取几天防节假日
+            if not klines or len(klines) < 5:
+                continue
+
+            # 只取最近 20 根 K 线（去除最早几根）
+            klines = klines[-20:]
+            # 计算每日涨跌幅
+            daily_changes: list[float] = []
+            for i in range(1, len(klines)):
+                prev_close = klines[i - 1].close
+                cur_close = klines[i].close
+                if prev_close and prev_close > 0:
+                    daily_changes.append((cur_close - prev_close) / prev_close * 100.0)
+
+            if len(daily_changes) < 3:
+                continue
+
+            breadth_up_pct = sum(1 for c in daily_changes if c > 0) / len(daily_changes) * 100.0
+            avg_change_pct = sum(daily_changes) / len(daily_changes)
+            volatility_pct = _stdev(daily_changes) if len(daily_changes) >= 2 else None
+
+            logger.debug(
+                "指数市场状态 [%s/%s]: breadth=%.1f%% avg=%.3f%% vol=%s n=%d",
+                market, symbol, breadth_up_pct, avg_change_pct,
+                f"{volatility_pct:.3f}" if volatility_pct is not None else "N/A",
+                len(daily_changes),
+            )
+            return {
+                "breadth_up_pct": breadth_up_pct,
+                "avg_change_pct": avg_change_pct,
+                "volatility_pct": volatility_pct,
+                "index_symbol": symbol,
+                "index_n": len(daily_changes),
+            }
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("获取指数 %s K 线失败，将降级到候选样本: %s", symbol, exc)
+            continue
+
+    return None
+
+
 def _build_market_regime_rows(
     *,
     snapshot: str,
@@ -401,17 +467,43 @@ def _build_market_regime_rows(
         mkt = (row.stock_market or "CN").strip().upper() or "CN"
         by_market.setdefault(mkt, []).append(row)
 
+    # 确保即使候选为空也至少处理 CN 市场
+    for default_mkt in ("CN",):
+        by_market.setdefault(default_mkt, [])
+
     out: dict[str, dict] = {}
     for market, rows in by_market.items():
         sample_size = len(rows)
-        if sample_size <= 0:
-            continue
         active_count = sum(1 for x in rows if (x.status or "inactive") == "active")
-        active_ratio = active_count / sample_size if sample_size else 0.0
+        active_ratio = active_count / sample_size if sample_size > 0 else 0.0
+
+        # 候选样本涨跌幅（备用）
         changes = [x for x in (_extract_candidate_quote_change_pct(r) for r in rows) if x is not None]
-        breadth_up_pct = (sum(1 for c in changes if c > 0) / len(changes) * 100.0) if changes else None
-        avg_change_pct = (sum(changes) / len(changes)) if changes else None
-        volatility_pct = _stdev(changes) if len(changes) >= 2 else None
+        sample_breadth_up_pct = (sum(1 for c in changes if c > 0) / len(changes) * 100.0) if changes else None
+        sample_avg_change_pct = (sum(changes) / len(changes)) if changes else None
+        sample_volatility_pct = _stdev(changes) if len(changes) >= 2 else None
+
+        # 优先使用全市场指数 K 线（无选择偏差）
+        index_data = _fetch_index_regime_data(market)
+
+        if index_data is not None:
+            # 使用指数数据作为主要信号
+            breadth_up_pct = index_data["breadth_up_pct"]
+            avg_change_pct = index_data["avg_change_pct"]
+            volatility_pct = index_data["volatility_pct"]
+            data_source = f"index:{index_data['index_symbol']}"
+        elif sample_size > 0:
+            # 降级：使用候选样本（存在选择偏差，但聊胜于无）
+            breadth_up_pct = sample_breadth_up_pct
+            avg_change_pct = sample_avg_change_pct
+            volatility_pct = sample_volatility_pct
+            data_source = f"sample:{sample_size}"
+            logger.warning("市场 %s 无指数数据，降级使用候选样本估计市场状态 (n=%d)", market, sample_size)
+        else:
+            # 无任何数据，跳过
+            logger.warning("市场 %s 无任何数据，跳过市场状态快照", market)
+            continue
+
         regime, regime_score, confidence = _classify_market_regime(
             breadth_up_pct=breadth_up_pct,
             avg_change_pct=avg_change_pct,
@@ -432,6 +524,10 @@ def _build_market_regime_rows(
             "meta": {
                 "active_signals": active_count,
                 "total_signals": sample_size,
+                "data_source": data_source,
+                # 保留候选样本指标便于对比
+                "sample_breadth_up_pct": round(sample_breadth_up_pct, 4) if sample_breadth_up_pct is not None else None,
+                "sample_avg_change_pct": round(sample_avg_change_pct, 4) if sample_avg_change_pct is not None else None,
             },
         }
     return out
@@ -636,6 +732,25 @@ def _build_cross_section_features(candidates: list[EntryCandidate]) -> dict[int,
             for c in rows
             if c.id is not None
         }
+        # 新增：多周期动量因子（从 meta.kline 中提取）
+        change_5d_values = {}
+        change_10d_values = {}
+        change_20d_values = {}
+        for c in rows:
+            if c.id is not None:
+                cid = int(c.id)
+                meta = c.meta if isinstance(c.meta, dict) else {}
+                kline_data = meta.get("kline") if isinstance(meta.get("kline"), dict) else {}
+                change_5d = _safe_float(kline_data.get("change_5d"))
+                change_10d = _safe_float(kline_data.get("change_10d"))
+                change_20d = _safe_float(kline_data.get("change_20d"))
+                if change_5d is not None:
+                    change_5d_values[cid] = float(change_5d)
+                if change_10d is not None:
+                    change_10d_values[cid] = float(change_10d)
+                if change_20d is not None:
+                    change_20d_values[cid] = float(change_20d)
+        
         turnover_values = {
             int(c.id): float(_extract_candidate_turnover(c) or 0.0)
             for c in rows
@@ -648,6 +763,10 @@ def _build_cross_section_features(candidates: list[EntryCandidate]) -> dict[int,
         }
         score_pct = _rank_map(score_values, reverse=True)
         change_pct = _rank_map(change_values, reverse=True)
+        # 多周期动量排名（若数据不足则回退到50，保持中立）
+        change_5d_pct = _rank_map(change_5d_values, reverse=True) if change_5d_values else {}
+        change_10d_pct = _rank_map(change_10d_values, reverse=True) if change_10d_values else {}
+        change_20d_pct = _rank_map(change_20d_values, reverse=True) if change_20d_values else {}
         turnover_pct = _rank_map(turnover_values, reverse=True)
         vol_pct = _rank_map(vol_values, reverse=True)
 
@@ -655,12 +774,22 @@ def _build_cross_section_features(candidates: list[EntryCandidate]) -> dict[int,
             if c.id is None:
                 continue
             cid = int(c.id)
-            rs = (
-                0.45 * float(score_pct.get(cid, 50.0))
-                + 0.25 * float(change_pct.get(cid, 50.0))
-                + 0.20 * float(turnover_pct.get(cid, 50.0))
-                + 0.10 * float(vol_pct.get(cid, 50.0))
+            # 改进的相对强度合成：加权多周期动量
+            # 权重设计（基于 A 股实证研究）：
+            #   - 当日排名（0.20）：短期反应，但权重最低避免过度波动
+            #   - 10日动量排名（0.40）：中期趋势最有效，A股验证 IC 12-18%
+            #   - 5日动量排名（0.20）：短期强势确认
+            #   - 候选评分（0.10）：质量判断
+            #   - 成交面（0.10）：资金参与度
+            momentum_rank = (
+                0.40 * float(change_10d_pct.get(cid, 50.0))
+                + 0.20 * float(change_5d_pct.get(cid, 50.0))
+                + 0.20 * float(change_pct.get(cid, 50.0))
+                + 0.10 * float(score_pct.get(cid, 50.0))
+                + 0.10 * float(turnover_pct.get(cid, 50.0))
             )
+            # momentum_rank 已经是 0-100 加权平均，无需重新缩放
+            rs = _clamp(momentum_rank, 0.0, 100.0)
             crowd = 0.0
             if rs >= 92:
                 crowd += 2.5
@@ -673,9 +802,11 @@ def _build_cross_section_features(candidates: list[EntryCandidate]) -> dict[int,
                 "market": market,
                 "score_pct": float(score_pct.get(cid, 50.0)),
                 "change_pct_rank": float(change_pct.get(cid, 50.0)),
+                "change_5d_pct_rank": float(change_5d_pct.get(cid, 50.0)),
+                "change_10d_pct_rank": float(change_10d_pct.get(cid, 50.0)),
                 "turnover_pct_rank": float(turnover_pct.get(cid, 50.0)),
                 "volume_pct_rank": float(vol_pct.get(cid, 50.0)),
-                "relative_strength_pct": round(_clamp(rs, 0.0, 100.0), 4),
+                "relative_strength_pct": round(rs, 4),
                 "crowding_risk": round(_clamp(crowd, 0.0, 6.0), 4),
             }
     return out
@@ -787,8 +918,20 @@ def _compute_factor_breakdown(
     regime_info: dict | None,
     cross_feature: dict | None = None,
     news_metric: dict | None = None,
+    strategy_win_rate: float | None = None,
 ) -> dict:
-    base_score = float(row.score or 0.0)
+    # 策略层基础分：按操作类型设定上限，留出因子加成空间
+    # 注意：比 entry_candidates 层的 ACTION_BASE_SCORE 低，因为还有多个正向因子叠加
+    _SCORE_BASE: dict[str, float] = {
+        "buy": 60.0,
+        "add": 56.0,
+        "hold": 44.0,
+        "watch": 38.0,
+        "alert": 32.0,
+        "reduce": 22.0,
+        "sell": 14.0,
+        "avoid": 10.0,
+    }
     action = (row.action or "watch").strip().lower() or "watch"
     is_holding = bool(row.is_holding_snapshot)
     signal_text = f"{row.signal or ''} {row.reason or ''}".lower()
@@ -805,12 +948,23 @@ def _compute_factor_breakdown(
     event_bias = float(_safe_float(nm.get("event_bias")) or 0.0)
     event_count = int(nm.get("news_count") or 0)
 
-    alpha_score = _clamp((base_score - 50.0) * 0.45, -12.0, 18.0)
-    if relative_strength_pct is not None:
-        alpha_score += _clamp((relative_strength_pct - 50.0) / 15.0, -2.0, 4.0)
+    # base_score：按 action 类型取基础分，再用候选评分做小幅质量调整 [-5, +8]
+    # 候选评分 >= 60 分时正向加成，< 60 时负向惩罚，保留候选质量信息但不作为主体
+    base_score = _SCORE_BASE.get(action, 38.0)
+    candidate_adj = _clamp((float(row.score or 0.0) - 60.0) / 5.0, -5.0, 8.0)
+    base_score += candidate_adj
+
+    # alpha_score：来自横截面相对强度排名（与 base_score 解耦，避免重复计数）
+    # relative_strength_pct=50 时为 0，=80 时为 +3，=100 时为 +5（上限），=20 时为 -3（下限）
+    alpha_score = (
+        _clamp((relative_strength_pct - 50.0) / 10.0, -4.0, 5.0)
+        if relative_strength_pct is not None
+        else 0.0
+    )
     catalyst_score = 0.0
     if is_market_scan:
         catalyst_score += 2.5
+    # 价格动量：适度涨幅正向，过热反而有回调风险
     if quote_change_pct is not None:
         if 1.0 <= quote_change_pct <= 7.0:
             catalyst_score += 4.0
@@ -818,19 +972,32 @@ def _compute_factor_breakdown(
             catalyst_score += 1.5
         elif quote_change_pct < -4.0:
             catalyst_score -= 2.5
+    # 技术信号（不与 alpha_score 的横截面排名重复）
     if ("突破" in signal_text) or ("breakout" in signal_text):
         catalyst_score += 2.5
     if "回踩" in signal_text:
         catalyst_score += 1.5
     if "超跌" in signal_text:
         catalyst_score += 1.0
+    # 量比信号：衡量放量质量（相对历史均量的倍数），比绝对换手额更有意义
+    # 健康放量（1.5-4x）是趋势延续的核心特征；异常放量（>5x）往往是主力出货尾声
+    if volume_ratio is not None:
+        if 1.5 <= volume_ratio <= 4.0:
+            catalyst_score += 2.0   # 健康放量：趋势延续信号
+        elif volume_ratio > 5.0:
+            catalyst_score -= 1.5   # 异常放量：可能是出货，移至 crowd_penalty 也处理
+        elif volume_ratio < 0.5:
+            catalyst_score -= 1.0   # 严重缩量：弱势，动能不足
+    # 新闻事件催化
     catalyst_score += _clamp(event_score * 0.55, -3.0, 6.5)
     if event_bias > 0.8:
         catalyst_score += 1.2
-    if relative_strength_pct is not None:
-        catalyst_score += _clamp((relative_strength_pct - 60.0) / 12.0, -2.5, 4.5)
+    # 注意：relative_strength_pct 已在 alpha_score 中完整体现，此处不重复计数
+    # 整体限幅：避免多个子项叠加后 catalyst 独自就过大
+    catalyst_score = _clamp(catalyst_score, -6.0, 10.0)
 
-    quality_score = _clamp((plan_quality - 50.0) / 5.0, -8.0, 10.0)
+    # quality_score：系数从 /5 → /8，范围从 [-8,10] → [-4,6]，降低入场计划质量的权重
+    quality_score = _clamp((plan_quality - 50.0) / 8.0, -4.0, 6.0)
     if event_count >= 3:
         quality_score += 0.8
 
@@ -847,19 +1014,35 @@ def _compute_factor_breakdown(
         risk_penalty += 2.2
 
     crowd_penalty = 0.0
+    # 涨幅过热：短线冲高后回调风险大
     if quote_change_pct is not None and quote_change_pct >= 9.0:
         crowd_penalty += 2.5
-    if volume_ratio is not None and volume_ratio >= 3.0:
-        crowd_penalty += 1.5
-    if turnover is not None and turnover >= 8_000_000_000:
-        crowd_penalty += 1.0
+    # 量比过大：>5x 异常放量，可能是主力拉高出货（与 catalyst 的 -1.5 形成双重抑制）
+    if volume_ratio is not None and volume_ratio > 5.0:
+        crowd_penalty += 2.0
+    # 注意：删除绝对换手额（turnover >= 8e9）的惩罚，因不同市值股票无可比性
+    # 换手率的相对量（量比）已由上方和 catalyst 处理
     crowd_penalty += _clamp(crowding_risk, 0.0, 6.0)
 
     source_bonus = 0.0
+    # 来源加成：经 AI Agent 确认的信号质量更高
     if (row.source_agent or "") in ("premarket_outlook", "intraday_monitor"):
         source_bonus += 1.0
-    if strategy_code in ("trend_follow", "volume_breakout", "macd_golden"):
-        source_bonus += 0.8
+    # 策略加成：基于历史胜率动态驱动（替代硬编码策略列表）
+    # win_rate 由 rebalance_strategy_weights() 计算后存入 StrategyWeight.meta
+    if strategy_win_rate is not None:
+        if strategy_win_rate >= 60.0:
+            source_bonus += 1.2   # 胜率 60%+ 优质策略
+        elif strategy_win_rate >= 50.0:
+            source_bonus += 0.8   # 胜率 50-60% 正向策略
+        elif strategy_win_rate >= 40.0:
+            source_bonus += 0.3   # 胜率 40-50% 中性
+        else:
+            source_bonus -= 0.5   # 胜率 <40% 弱势策略轻微减分
+    else:
+        # 无历史数据时：给所有策略中性加成（0.5），避免新策略因无数据被歧视
+        source_bonus += 0.5
+    # 相对强度极高：代表当前市场认可
     if relative_strength_pct is not None and relative_strength_pct >= 80:
         source_bonus += 0.8
 
@@ -1250,6 +1433,18 @@ def refresh_strategy_signals(
             existing[(int(cand_id), str(code or ""))] = row
 
         weight_cache: dict[str, dict[str, float]] = {}
+        # 预加载各策略的历史胜率（存储在 StrategyWeight.meta['win_rate']）
+        # key: (strategy_code, market)  value: win_rate (0-100)
+        win_rate_cache: dict[tuple[str, str], float | None] = {}
+        all_weights = db.query(StrategyWeight).all()
+        for sw in all_weights:
+            meta = sw.meta if isinstance(sw.meta, dict) else {}
+            wr = meta.get("win_rate")
+            if wr is not None:
+                try:
+                    win_rate_cache[(str(sw.strategy_code), str(sw.market or "ALL").upper())] = float(wr)
+                except (TypeError, ValueError):
+                    pass
         touched_keys: set[tuple[int, str]] = set()
         touched_rows: list[StrategySignalRun] = []
 
@@ -1285,6 +1480,8 @@ def refresh_strategy_signals(
                     regime_info=regime_info,
                     cross_feature=cross_features.get(int(c.id)) if c.id is not None else None,
                     news_metric=normalized_news_metric,
+                    strategy_win_rate=win_rate_cache.get((code, market))
+                    or win_rate_cache.get((code, "ALL")),
                 )
                 rank_score = float(score_breakdown.get("weighted_score") or 0.0)
                 confidence = c.confidence if c.confidence is not None else round(rank_score / 100.0, 3)
@@ -1784,14 +1981,14 @@ def rebalance_strategy_weights(
                     regime=reg,
                     weight=new_weight,
                     reason=reason,
-                    meta={"window_days": window_days, "sample_size": sample_size},
+                    meta={"window_days": window_days, "sample_size": sample_size, "win_rate": round(win_rate, 2)},
                     effective_from=utc_now(),
                 )
                 db.add(row)
             else:
                 row.weight = new_weight
                 row.reason = reason
-                row.meta = {"window_days": window_days, "sample_size": sample_size}
+                row.meta = {"window_days": window_days, "sample_size": sample_size, "win_rate": round(win_rate, 2)}
                 row.effective_from = utc_now()
                 row.updated_at = utc_now()
 

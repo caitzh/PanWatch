@@ -250,8 +250,9 @@ class TechnicalIndicators:
     volume_ma5: float | None = None
     volume_ma10: float | None = None
     volume_trend: str | None = None  # 放量/缩量/平量
-    # 涨跌幅
+    # 涨跌幅（多周期动量因子，学术验证 10/20日动量在 A 股最有效）
     change_5d: float | None = None
+    change_10d: float | None = None
     change_20d: float | None = None
     # 振幅
     amplitude: float | None = None  # 今日振幅
@@ -644,11 +645,14 @@ class KlineCollector:
             else:
                 volume_trend = "平量"
 
-        # 涨跌幅
+        # 涨跌幅（多周期动量因子）
         change_5d = None
+        change_10d = None
         change_20d = None
         if len(closes) >= 6:
             change_5d = (closes[-1] - closes[-6]) / closes[-6] * 100
+        if len(closes) >= 11:
+            change_10d = (closes[-1] - closes[-11]) / closes[-11] * 100
         if len(closes) >= 21:
             change_20d = (closes[-1] - closes[-21]) / closes[-21] * 100
 
@@ -713,6 +717,7 @@ class KlineCollector:
             volume_ma10=volume_ma10,
             volume_trend=volume_trend,
             change_5d=change_5d,
+            change_10d=change_10d,
             change_20d=change_20d,
             amplitude=amplitude,
             amplitude_avg5=amplitude_avg5,
@@ -851,6 +856,7 @@ class KlineCollector:
             "ma60": indicators.ma60,
             # 涨跌幅
             "change_5d": indicators.change_5d,
+            "change_10d": indicators.change_10d,
             "change_20d": indicators.change_20d,
             # 振幅
             "amplitude": indicators.amplitude,

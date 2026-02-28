@@ -96,6 +96,7 @@ class StockData:
     high_price: float
     low_price: float
     prev_close: float
+    turnover_rate: float | None = None  # 换手率(%)，A股专用
     timestamp: datetime = field(default_factory=datetime.now)
 
 

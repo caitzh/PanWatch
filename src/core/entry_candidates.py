@@ -1520,6 +1520,10 @@ def refresh_entry_candidates(
                             "volume_ratio": kline.get("volume_ratio"),
                             "support": kline.get("support"),
                             "resistance": kline.get("resistance"),
+                            # 历史动量因子（用于多周期相对强度排名）
+                            "change_5d": kline.get("change_5d"),
+                            "change_10d": kline.get("change_10d"),
+                            "change_20d": kline.get("change_20d"),
                         },
                         "strategy_tags": strategy_tags,
                         "is_holding_snapshot": bool(is_holding),
