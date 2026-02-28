@@ -304,6 +304,88 @@ class CapitalFlowCollector:
             logger.error("东方财富资金流向采集失败 %s: %s", symbol, e)
             return {"error": str(e)}
 
+    def batch_get(
+        self,
+        symbols: list[str],
+        *,
+        workers: int = 8,
+        per_symbol_timeout: float = 6.0,
+        total_timeout: float = 60.0,
+    ) -> dict[str, dict]:
+        """并发批量采集资金流向数据。
+
+        策略：
+        - 先批量读缓存，命中的直接返回，未命中的提交到线程池并发拉取
+        - workers：并发线程数（默认 8，AKShare 是 IO 密集型，多线程有效）
+        - per_symbol_timeout：单只股票最大等待时间（秒）
+        - total_timeout：整批采集最大总时间（秒）
+
+        返回：{symbol: summary_dict}，失败/超时的 symbol 不出现在结果中
+        """
+        import concurrent.futures
+        import time as _time
+
+        if not symbols:
+            return {}
+
+        result: dict[str, dict] = {}
+        now = _time.time()
+
+        # 第一步：批量读缓存，已缓存的直接放入结果
+        pending: list[str] = []
+        for sym in symbols:
+            # 进程内缓存
+            if sym in self._mem_cache:
+                ts, data = self._mem_cache[sym]
+                if now - ts < _MEM_TTL_SEC:
+                    result[sym] = data
+                    continue
+            # SQLite 持久缓存
+            cached = _read_db_cache(sym)
+            if cached and not cached.get("error"):
+                cached["cached"] = True
+                self._mem_cache[sym] = (now, cached)
+                result[sym] = cached
+                continue
+            pending.append(sym)
+
+        if not pending:
+            return result
+
+        # 第二步：对未命中缓存的股票并发采集
+        batch_start = _time.monotonic()
+
+        def _fetch_one(sym: str) -> tuple[str, dict | None]:
+            """单只采集，返回 (symbol, data_or_None)"""
+            try:
+                data = self.get_capital_flow_summary(sym)
+                if data and not data.get("error"):
+                    return sym, data
+            except Exception:
+                pass
+            return sym, None
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
+            future_map = {executor.submit(_fetch_one, sym): sym for sym in pending}
+            try:
+                for future in concurrent.futures.as_completed(
+                    future_map, timeout=min(per_symbol_timeout * len(pending), total_timeout)
+                ):
+                    sym, data = future.result(timeout=per_symbol_timeout)
+                    if data is not None:
+                        result[sym] = data
+                    # 检查总超时
+                    if _time.monotonic() - batch_start > total_timeout:
+                        break
+            except concurrent.futures.TimeoutError:
+                pass  # 超时后直接返回已采集的结果，剩余的降级为 0
+            finally:
+                # 取消尚未开始的 future（已在运行的无法取消，但会被忽略）
+                for f in future_map:
+                    f.cancel()
+
+        return result
+
     # 保留向后兼容的方法
     def get_capital_flow(self, symbol: str) -> CapitalFlow | None:
         """向后兼容接口，内部直接调 get_capital_flow_summary"""
