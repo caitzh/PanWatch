@@ -9,8 +9,9 @@ from src.models.market import MarketCode
 
 logger = logging.getLogger(__name__)
 
-# 东方财富资金流向 API（使用 delay 版本更稳定）
-EASTMONEY_FLOW_URL = "https://push2delay.eastmoney.com/api/qt/stock/get"
+# 东方财富资金流向 API（fflow 接口）
+# push2: 实时数据（仅当日），push2his: 历史数据（含当日）
+EASTMONEY_FLOW_URL = "https://push2his.eastmoney.com/api/qt/stock/fflow/kline/get"
 
 
 @dataclass
@@ -20,8 +21,8 @@ class CapitalFlow:
     name: str
 
     # 今日资金流（单位：元）
-    main_net_inflow: float      # 主力净流入
-    main_net_inflow_pct: float  # 主力净流入占比
+    main_net_inflow: float      # 主力净流入（大单+超大单）
+    main_net_inflow_pct: float  # 主力净流入占比（估算）
     super_net_inflow: float     # 超大单净流入
     big_net_inflow: float       # 大单净流入
     mid_net_inflow: float       # 中单净流入
@@ -51,10 +52,14 @@ class CapitalFlowCollector:
         """获取单只股票的资金流向"""
         secid = _get_eastmoney_secid(symbol, self.market)
 
+        # 使用 fflow API 获取资金流向
+        # klt=101 表示日线，lmt=5 表示最近5天
         params = {
             "secid": secid,
-            "fields": "f57,f58,f62,f184,f66,f69,f72,f75,f78,f81,f84,f87,f64,f65,f70,f71,f76,f77,f82,f83,f164,f166,f168,f170,f172,f252,f253,f254,f255,f256",
-            "ut": "fa5fd1943c7b386f172d6893dbfba10b",
+            "klt": "101",
+            "lmt": "5",
+            "fields1": "f1,f2,f3,f7",
+            "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61,f62,f63",
         }
 
         headers = {
@@ -67,22 +72,53 @@ class CapitalFlowCollector:
                 resp = client.get(EASTMONEY_FLOW_URL, params=params, headers=headers)
                 data = resp.json()
 
-            if data.get("data") is None:
+            if data.get("data") is None or data["data"].get("klines") is None:
                 logger.warning(f"获取 {symbol} 资金流向失败: 无数据")
                 return None
 
-            d = data["data"]
+            klines = data["data"]["klines"]
+            if not klines:
+                logger.warning(f"获取 {symbol} 资金流向失败: klines 为空")
+                return None
+
+            name = data["data"].get("name", "")
+
+            # 解析最近一天的数据（klines 按时间从旧到新排序，取最后一条）
+            # 格式: 日期,主力净流入,小单净流入,中单净流入,大单净流入,超大单净流入
+            today_parts = klines[-1].split(",")
+            if len(today_parts) < 6:
+                logger.warning(f"获取 {symbol} 资金流向失败: 数据格式错误")
+                return None
+
+            main_net_inflow = float(today_parts[1])      # 主力净流入
+            small_net_inflow = float(today_parts[2])     # 小单净流入
+            mid_net_inflow = float(today_parts[3])       # 中单净流入
+            big_net_inflow = float(today_parts[4])       # 大单净流入
+            super_net_inflow = float(today_parts[5])     # 超大单净流入
+
+            # 计算主力净流入占比（基于总成交额的估算）
+            # 主力净流入占比 = 主力净流入 / (|主力净流入| + |中单净流入| + |小单净流入|) * 100
+            total_flow = abs(main_net_inflow) + abs(mid_net_inflow) + abs(small_net_inflow)
+            if total_flow > 0:
+                main_net_inflow_pct = main_net_inflow / total_flow * 100
+            else:
+                main_net_inflow_pct = 0
+
+            # 计算5日主力净流入
+            main_net_5d = None
+            if len(klines) >= 1:
+                main_net_5d = sum(float(k.split(",")[1]) for k in klines)
 
             return CapitalFlow(
-                symbol=str(d.get("f57", symbol)),
-                name=str(d.get("f58", "")),
-                main_net_inflow=float(d.get("f62", 0)),        # 主力净流入
-                main_net_inflow_pct=float(d.get("f184", 0)),   # 主力净流入占比
-                super_net_inflow=float(d.get("f66", 0)),       # 超大单净流入
-                big_net_inflow=float(d.get("f72", 0)),         # 大单净流入
-                mid_net_inflow=float(d.get("f78", 0)),         # 中单净流入
-                small_net_inflow=float(d.get("f84", 0)),       # 小单净流入
-                main_net_5d=float(d.get("f164", 0)) if d.get("f164") else None,
+                symbol=symbol,
+                name=name,
+                main_net_inflow=main_net_inflow,
+                main_net_inflow_pct=main_net_inflow_pct,
+                super_net_inflow=super_net_inflow,
+                big_net_inflow=big_net_inflow,
+                mid_net_inflow=mid_net_inflow,
+                small_net_inflow=small_net_inflow,
+                main_net_5d=main_net_5d,
             )
 
         except Exception as e:

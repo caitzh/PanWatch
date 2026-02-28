@@ -84,6 +84,8 @@ AGENT_SEED_SPECS: tuple[AgentSeedSpec, ...] = (
             "stop_loss_warning": -5.0,
             "take_profit_warning": 10.0,
             "throttle_minutes": 30,
+            "enable_chart_screenshot": False,
+            "screenshot_period": "daily",
         },
     ),
     AgentSeedSpec(

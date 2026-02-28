@@ -73,6 +73,7 @@ class DailyReportAgent(BaseAgent):
             include_capital_flow=True,
             include_events=True,
             events_days=7,
+            include_fundamental=True,
         )
 
         context_builder = ContextBuilder()
@@ -257,6 +258,36 @@ class DailyReportAgent(BaseAgent):
                 )
                 if flow.get("trend_5d") and flow.get("trend_5d") != "无数据":
                     lines.append(f"- 5日资金：{flow['trend_5d']}")
+
+            # 基本面（季报数据）
+            fund = getattr(pack, "fundamental", None) if pack else None
+            if isinstance(fund, dict) and fund and not fund.get("error"):
+                period = fund.get("period_label", "")
+                parts_f = []
+                revenue = fund.get("revenue")
+                rev_yoy = fund.get("revenue_yoy")
+                if revenue is not None:
+                    rev_s = f"{revenue/1e8:.2f}亿" if abs(revenue) >= 1e8 else f"{revenue/1e4:.0f}万"
+                    yoy_s = f"(同比{rev_yoy:+.1f}%)" if rev_yoy is not None else ""
+                    parts_f.append(f"营收{rev_s}{yoy_s}")
+                net_profit = fund.get("net_profit")
+                np_yoy = fund.get("net_profit_yoy")
+                if net_profit is not None:
+                    np_s = f"{net_profit/1e8:.2f}亿" if abs(net_profit) >= 1e8 else f"{net_profit/1e4:.0f}万"
+                    yoy_s = f"(同比{np_yoy:+.1f}%)" if np_yoy is not None else ""
+                    parts_f.append(f"净利{np_s}{yoy_s}")
+                roe = fund.get("roe")
+                gross = fund.get("gross_margin")
+                debt = fund.get("debt_ratio")
+                metrics_f = []
+                if roe is not None:
+                    metrics_f.append(f"ROE {roe:.1f}%")
+                if gross is not None:
+                    metrics_f.append(f"毛利率 {gross:.1f}%")
+                if debt is not None:
+                    metrics_f.append(f"负债率 {debt:.1f}%")
+                if parts_f or metrics_f:
+                    lines.append(f"- 基本面（{period}）：{'  '.join(parts_f)}{'  ' if parts_f and metrics_f else ''}{'  '.join(metrics_f)}")
 
             # 相关新闻/公告
             stock_news = (

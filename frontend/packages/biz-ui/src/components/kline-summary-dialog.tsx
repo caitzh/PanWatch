@@ -91,38 +91,12 @@ export function KlineSummaryDialog({
   const [summary, setSummary] = useState<KlineSummaryData | null>(null)
   const [error, setError] = useState<string | null>(null)
 
+  // 直接使用 kline-scorer.ts 的评分结果，不在此处重复逻辑
   const buildSuggestion = (s: KlineSummaryData, holding?: boolean) => {
     const scored = buildKlineSuggestion(s, holding)
-    const items: Array<{ text: string; delta: number }> = []
-    let localScore = 0
-
-    const add = (text: string, delta: number) => { items.push({ text, delta }); localScore += delta }
-
-    if (s.trend?.includes('多头')) add('均线多头排列，趋势偏强', 2)
-    else if (s.trend?.includes('空头')) add('均线空头排列，趋势偏弱', -2)
-
-    if (s.macd_status?.includes('金叉')) add('MACD 金叉，短线动能偏强', 2)
-    if (s.macd_status?.includes('死叉')) add('MACD 死叉，短线动能转弱', -2)
-    if (typeof s.macd_hist === 'number') add(`MACD 柱体${s.macd_hist > 0 ? '为正' : s.macd_hist < 0 ? '为负' : '接近0'}`, s.macd_hist > 0 ? 1 : s.macd_hist < 0 ? -1 : 0)
-
-    if (s.rsi_status?.includes('超卖')) add('RSI 超卖，可能存在反弹', 1)
-    else if (s.rsi_status?.includes('偏强')) add('RSI 偏强，买盘占优', 1)
-    else if (s.rsi_status?.includes('超买')) add('RSI 超买，注意回调风险', -1)
-    else if (s.rsi_status?.includes('偏弱')) add('RSI 偏弱，短线承压', -1)
-
-    if (s.kdj_status?.includes('金叉')) add('KDJ 金叉，短线转强', 1)
-    if (s.kdj_status?.includes('死叉')) add('KDJ 死叉，短线转弱', -1)
-
-    if (s.boll_status?.includes('突破上轨')) add('突破布林上轨，趋势强势', 1)
-    else if (s.boll_status?.includes('跌破下轨')) add('跌破布林下轨，走势偏弱', -1)
-
-    if (s.volume_trend?.includes('放量')) add('放量配合，资金参与度提升', 1)
-    else if (s.volume_trend?.includes('缩量')) add('缩量，动能不足', -1)
-
-    if (s.last_close != null && s.support != null && s.support > 0 && s.last_close <= s.support * 1.02) add('价格接近支撑位，止跌反弹概率提升', 1)
-    if (s.last_close != null && s.resistance != null && s.resistance > 0 && s.last_close >= s.resistance * 0.98) add('价格接近压力位，上行空间受限', -1)
-
-    return { ...scored, score: localScore, items }
+    // evidence 已含完整评分明细，items 格式对齐 dialog 展示需要
+    const items = scored.evidence.map(e => ({ text: e.text, delta: e.delta }))
+    return { ...scored, items }
   }
 
   useEffect(() => {
@@ -186,12 +160,20 @@ export function KlineSummaryDialog({
                     size="sm"
                   />
                   <span className="text-[10px] text-muted-foreground">
-                    {hasPosition ? '已持仓' : '未持仓'} · score {suggestion.score}
+                    {hasPosition ? '已持仓' : '未持仓'} · 得分 {suggestion.score}
                   </span>
                 </div>
                 <div className="mt-2 text-[12px] text-foreground font-medium">
                   {suggestion.signal}
                 </div>
+
+                {suggestion.warnings && suggestion.warnings.length > 0 && (
+                  <div className="mt-1.5 space-y-0.5">
+                    {suggestion.warnings.map((w, i) => (
+                      <div key={i} className="text-[11px] text-amber-600 dark:text-amber-400">{w}</div>
+                    ))}
+                  </div>
+                )}
 
                 {suggestion.items.length > 0 && (
                   <div className="mt-2 space-y-1">
@@ -692,18 +674,20 @@ export function KlineSummaryDialog({
               <div className="mt-2 text-[11px] text-muted-foreground whitespace-pre-wrap bg-accent/20 rounded p-2 space-y-2">
                 <div className="font-medium text-foreground">建议规则（按是否持仓）</div>
                 <div className="space-y-1">
-                  <div>未持仓：score ≥ 3 → 买入；score ≤ -2 → 回避；其他 → 观望</div>
-                  <div>已持仓：score ≥ 3 → 加仓；score ≥ 1 → 持有；score ≤ -3 → 卖出；score ≤ -1 → 减仓；其他 → 观望</div>
+                  <div>未持仓：得分 ≥ 4 → 买入；得分 ≤ -3 → 回避；其他 → 观望</div>
+                  <div>已持仓：得分 ≥ 4 → 加仓；得分 ≥ 1 → 持有；得分 ≤ -4 → 卖出；得分 ≤ -1 → 减仓；其他 → 观望</div>
                 </div>
                 <div className="font-medium text-foreground">评分规则（各项累加，0 为中性）</div>
                 <div className="space-y-1">
-                  <div>趋势（均线）：多头排列 +2；空头排列 -2</div>
+                  <div>趋势（均线）：多头排列 +1~+3（按 MA5/MA10 偏离度加权）；空头排列 -1~-3</div>
                   <div>MACD：金叉 +2；死叉 -2；柱体为正 +1；柱体为负 -1</div>
                   <div>RSI：超卖 +1；偏强 +1；超买 -1；偏弱 -1</div>
-                  <div>KDJ：金叉 +1；死叉 -1</div>
-                  <div>布林：突破上轨 +1；跌破下轨 -1</div>
-                  <div>量能：放量 +1；缩量 -1</div>
-                  <div>支撑/压力：收盘价 ≤ 支撑×1.02 → +1；收盘价 ≥ 压力×0.98 → -1</div>
+                  <div>KDJ：低位金叉（K&lt;30）+2；普通金叉 +1；高位死叉（K&gt;70）-2；普通死叉 -1</div>
+                  <div>布林：突破上轨 +1；跌破下轨 -1；带宽 &lt;5% 提示收口；带宽 &gt;20% 提示波动扩张</div>
+                  <div>量能：放量 +1；下跌缩量 0（抛压减弱，中性）；上涨缩量 -1</div>
+                  <div>支撑/压力：动态阈值（振幅×0.6，限 1%~4%）；靠近支撑 +1；靠近压力 -1</div>
+                  <div>K 线形态：锤子/吞没/星形等强势形态 +1~+2；三鸦/高位穿头破脚等弱势形态 -1~-2</div>
+                  <div>反向信号：多头+超买+缩量 → 滞涨警告 -1</div>
                 </div>
               </div>
             </details>

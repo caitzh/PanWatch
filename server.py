@@ -254,11 +254,16 @@ def seed_agents():
             # 仅在用户未配置时补齐默认 config
             if spec.config and (not existing.config):
                 existing.config = spec.config
-            # 对已存在配置做“向前兼容”的字段补齐（不覆盖用户已有值）
+            # 对已存在配置做"向前兼容"的字段补齐（不覆盖用户已有值）
             if existing.name == "intraday_monitor":
                 cfg = existing.config or {}
                 if isinstance(cfg, dict) and "event_only" not in cfg:
                     cfg["event_only"] = True
+                    existing.config = cfg
+                # 补齐截图相关字段（新增）
+                if isinstance(cfg, dict) and "enable_chart_screenshot" not in cfg:
+                    cfg["enable_chart_screenshot"] = False
+                    cfg.setdefault("screenshot_period", "daily")
                     existing.config = cfg
 
     db.commit()

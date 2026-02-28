@@ -44,6 +44,7 @@ class SignalPack:
     position: PositionSnapshot | None = None
     news: NewsSnapshot | None = None
     capital_flow: dict | None = None
+    fundamental: dict | None = None
     events: EventsSnapshot | None = None
     sources: dict[str, str] = field(default_factory=dict)
     missing: list[str] = field(default_factory=list)
@@ -65,6 +66,7 @@ class SignalPackBuilder:
         self._flow_source_cache: dict[tuple[MarketCode, str], str] = {}
         self._events_cache: dict[tuple[str, int], list[dict]] = {}
         self._events_source_cache: dict[tuple[str, int], str] = {}
+        self._fundamental_cache: dict[tuple[MarketCode, str], dict] = {}
 
     @staticmethod
     def _source_policy(
@@ -121,6 +123,7 @@ class SignalPackBuilder:
         portfolio,
         include_technical: bool = True,
         include_capital_flow: bool = False,
+        include_fundamental: bool = False,
         include_events: bool = False,
         events_days: int = 7,
     ) -> dict[str, SignalPack]:
@@ -398,7 +401,22 @@ class SignalPackBuilder:
                         continue
                     events_by_symbol.setdefault(sym, []).append(it)
 
-        # 6) Position
+        # 6) Fundamental (CN only)
+        fundamental_map: dict[str, dict] = {}
+        if include_fundamental:
+            cn_symbols = [sym for sym, market, _ in symbols if market == MarketCode.CN]
+            for sym in cn_symbols:
+                key = (MarketCode.CN, sym)
+                if key not in self._fundamental_cache:
+                    try:
+                        from src.collectors.fundamental_collector import FundamentalCollector
+                        self._fundamental_cache[key] = FundamentalCollector().get_fundamental_summary(sym)
+                    except Exception as e:
+                        logger.warning(f"SignalPack fundamental 采集失败 {sym}: {e}")
+                        self._fundamental_cache[key] = {"error": str(e)}
+                fundamental_map[sym] = self._fundamental_cache[key]
+
+        # 7) Position
         packs: dict[str, SignalPack] = {}
         for sym, market, name in symbols:
             pos_list = []
@@ -464,6 +482,9 @@ class SignalPackBuilder:
                 else None,
                 capital_flow=flow_map.get(sym)
                 if (include_capital_flow and market == MarketCode.CN)
+                else None,
+                fundamental=fundamental_map.get(sym)
+                if (include_fundamental and market == MarketCode.CN)
                 else None,
                 events=EventsSnapshot(
                     days=int(events_days), items=events_by_symbol.get(sym, [])[:5]

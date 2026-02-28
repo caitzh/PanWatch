@@ -623,6 +623,35 @@ export default function AgentsPage() {
                           )}
                         </div>
                       )}
+
+                      {/* K 线截图选项（仅 intraday_monitor） */}
+                      {agent.name === 'intraday_monitor' && (
+                        <div className="flex items-center gap-2 flex-wrap">
+                          <span className="text-[11px] text-muted-foreground">K线截图:</span>
+                          <button
+                            onClick={async () => {
+                              const cfg = (agent.config || {}) as Record<string, unknown>
+                              const newConfig = {
+                                ...cfg,
+                                enable_chart_screenshot: !cfg.enable_chart_screenshot,
+                              }
+                              await fetchAPI(`/agents/${agent.name}`, {
+                                method: 'PUT',
+                                body: JSON.stringify({ config: newConfig }),
+                              })
+                              // 重新加载列表
+                              await load()
+                            }}
+                            className={`text-[11px] px-2.5 py-1 rounded-md border transition-colors ${
+                              (agent.config as Record<string, unknown>)?.enable_chart_screenshot
+                                ? 'bg-emerald-600/20 border-emerald-500/40 text-emerald-600'
+                                : 'bg-accent/30 border-border/50 text-muted-foreground hover:border-primary/30'
+                            }`}
+                          >
+                            {(agent.config as Record<string, unknown>)?.enable_chart_screenshot ? '✓ 已启用' : '未启用'}
+                          </button>
+                        </div>
+                      )}
                     </div>
                   </div>
                   <div className="flex items-center gap-2 flex-shrink-0 ml-[22px] sm:ml-0">

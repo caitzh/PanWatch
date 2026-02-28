@@ -79,6 +79,8 @@ class IntradayMonitorAgent(BaseAgent):
         volume_alert_ratio: float = 2.0,
         stop_loss_warning: float = -5.0,
         take_profit_warning: float = 10.0,
+        enable_chart_screenshot: bool = False,
+        screenshot_period: str = "daily",
     ):
         """
         Args:
@@ -89,6 +91,8 @@ class IntradayMonitorAgent(BaseAgent):
             volume_alert_ratio: 量比超过阈值视为放量异动
             stop_loss_warning: 浮亏超过阈值触发止损预警（%）
             take_profit_warning: 浮盈超过阈值触发止盈提醒（%）
+            enable_chart_screenshot: 是否启用 K 线截图多模态分析（需要 Vision 模型）
+            screenshot_period: 截图 K 线周期 daily/weekly/monthly
         """
         self.throttle_minutes = throttle_minutes
         self.bypass_throttle = bypass_throttle
@@ -98,6 +102,8 @@ class IntradayMonitorAgent(BaseAgent):
         self.volume_alert_ratio = volume_alert_ratio
         self.stop_loss_warning = stop_loss_warning
         self.take_profit_warning = take_profit_warning
+        self.enable_chart_screenshot = enable_chart_screenshot
+        self.screenshot_period = screenshot_period
 
     async def collect(self, context: AgentContext) -> dict:
         """采集实时行情 + K线 + 历史分析"""
@@ -129,6 +135,7 @@ class IntradayMonitorAgent(BaseAgent):
             portfolio=context.portfolio,
             include_technical=True,
             include_capital_flow=True,
+            include_fundamental=True,
             include_events=True,
             events_days=3,
         )
@@ -152,6 +159,14 @@ class IntradayMonitorAgent(BaseAgent):
 
         kline_summary = pack.technical if pack else None
 
+        # 采集大盘指数（仅 A 股）
+        market_indices = []
+        if market == MarketCode.CN:
+            try:
+                market_indices = await AkshareCollector(MarketCode.CN).get_index_data()
+            except Exception as e:
+                logger.warning(f"大盘指数采集失败: {e}")
+
         # 获取历史分析（为 AI 提供更多上下文）
         daily_analysis = get_latest_analysis(
             agent_name="daily_report",
@@ -164,6 +179,32 @@ class IntradayMonitorAgent(BaseAgent):
             analysis_date=date.today(),
         )
 
+        # 可选：K 线截图（多模态分析）
+        screenshot = None
+        if self.enable_chart_screenshot:
+            try:
+                from src.collectors.screenshot_collector import ScreenshotCollector
+
+                collector = ScreenshotCollector()
+                try:
+                    screenshot = await collector.capture(
+                        symbol=symbol,
+                        name=name,
+                        market=market.value,
+                        period=self.screenshot_period,
+                        provider="xueqiu",
+                    )
+                finally:
+                    await collector.close()
+                if screenshot and screenshot.exists:
+                    logger.info(f"K 线截图成功: {symbol} -> {screenshot.filepath}")
+                else:
+                    logger.warning(f"K 线截图失败或文件不存在，将继续纯文本分析: {symbol}")
+                    screenshot = None
+            except Exception as e:
+                logger.warning(f"K 线截图异常，继续纯文本分析: {e}")
+                screenshot = None
+
         return {
             "stocks": [stock_data] if stock_data else [],
             "stock_data": stock_data,
@@ -175,6 +216,8 @@ class IntradayMonitorAgent(BaseAgent):
             else None,
             "symbol_context": symbol_context,
             "quality_overview": quality_overview,
+            "market_indices": market_indices,
+            "screenshot": screenshot,
             "timestamp": datetime.now().isoformat(),
         }
 
@@ -182,7 +225,7 @@ class IntradayMonitorAgent(BaseAgent):
         """构建盘中分析 Prompt"""
         system_prompt = PROMPT_PATH.read_text(encoding="utf-8")
 
-        # 辅助函数：安全获取数值，None 转为默认值
+        # 辅助函数
         def safe_num(value, default=0):
             return value if value is not None else default
 
@@ -191,286 +234,283 @@ class IntradayMonitorAgent(BaseAgent):
                 return "N/A"
             return f"{value:.{precision}f}"
 
+        def format_money(value):
+            """格式化金额，自动选择万/亿单位"""
+            if value is None:
+                return "N/A"
+            if abs(value) >= 1e8:
+                return f"{value/1e8:.2f}亿"
+            return f"{value/1e4:.0f}万"
+
+        def classify_news_sentiment(title: str) -> str:
+            """简单关键词情感分类"""
+            bullish = ["上涨", "盈利", "增长", "利好", "突破", "涨停", "回购", "增持", "超预期", "重组", "获批", "合同", "中标", "签约"]
+            bearish = ["下跌", "亏损", "违规", "处罚", "调查", "减持", "利空", "暴跌", "跌停", "负面", "被罚", "立案", "退市"]
+            for w in bullish:
+                if w in title:
+                    return "[利好]"
+            for w in bearish:
+                if w in title:
+                    return "[利空]"
+            return "[中性]"
+
         stock: StockData | None = data.get("stock_data")
         if not stock:
             return system_prompt, "无股票数据"
 
-        # 获取所有账户的持仓信息
         positions = context.portfolio.get_positions_for_stock(stock.symbol)
-        style_labels = {"short": "短线", "swing": "波段", "long": "长线"}
 
         lines = []
-        lines.append(f"## 时间：{datetime.now().strftime('%Y-%m-%d %H:%M')}\n")
 
-        # 股票行情
+        # 0. 市场环境（大盘）
+        market_indices = data.get("market_indices") or []
+        if market_indices:
+            lines.append("【市场环境】")
+            for idx in market_indices:
+                arrow = "↑" if idx.change_pct > 0 else ("↓" if idx.change_pct < 0 else "→")
+                lines.append(f"{idx.name}：{idx.current_price:.2f}  {arrow}{idx.change_pct:+.2f}%")
+            avg_chg = sum(i.change_pct for i in market_indices) / len(market_indices)
+            if avg_chg >= 1.0:
+                market_sentiment = "偏强（指数普涨）"
+            elif avg_chg <= -1.0:
+                market_sentiment = "偏弱（指数普跌）"
+            else:
+                market_sentiment = "中性震荡"
+            lines.append(f"市场情绪：{market_sentiment}")
+
         current_price = safe_num(stock.current_price)
         change_pct = safe_num(stock.change_pct)
-        change_amount = safe_num(stock.change_amount)
         open_price = safe_num(stock.open_price)
         high_price = safe_num(stock.high_price)
         low_price = safe_num(stock.low_price)
         prev_close = safe_num(stock.prev_close)
-        volume = safe_num(stock.volume)
-        turnover = safe_num(stock.turnover)
 
-        lines.append("## 股票行情")
-        lines.append(f"- 股票：{stock.name}（{stock.symbol}）")
-        lines.append(f"- 现价：{current_price:.2f}")
-        lines.append(f"- 涨跌幅：{change_pct:+.2f}%")
-        lines.append(f"- 涨跌额：{change_amount:+.2f}")
-        lines.append(f"- 今开：{open_price:.2f}")
-        lines.append(f"- 最高：{high_price:.2f}")
-        lines.append(f"- 最低：{low_price:.2f}")
-        lines.append(f"- 昨收：{prev_close:.2f}")
-        if volume > 0:
-            lines.append(f"- 成交量：{volume:.0f} 手")
-        if turnover > 0:
-            lines.append(f"- 成交额：{turnover / 10000:.0f} 万")
+        # 1. 基本信息（精简）
+        lines.append("【基本信息】")
+        lines.append(f"股票：{stock.name}（{stock.symbol}）")
+        lines.append(f"现价：{current_price:.2f}  涨跌：{change_pct:+.2f}%")
+        lines.append(f"今开/最高/最低：{open_price:.2f} / {high_price:.2f} / {low_price:.2f}")
+        lines.append(f"昨收：{prev_close:.2f}")
+        
+        # 计算日内位置（当前价在日内高低点中的位置）
+        day_range = high_price - low_price if high_price != low_price else 1
+        day_position = (current_price - low_price) / day_range * 100
+        lines.append(f"日内位置：{day_position:.0f}%（0%=最低点，100%=最高点）")
 
-        # 系统阈值（帮助 AI 做出更稳定的“提醒/不提醒”判断）
-        lines.append("\n## 系统阈值")
-        lines.append(f"- 价格异动：|涨跌幅| ≥ {self.price_alert_threshold:.1f}%")
-        lines.append(f"- 量能异动：量比 ≥ {self.volume_alert_ratio:.1f}")
-        lines.append(f"- 止损预警：浮亏 ≤ {self.stop_loss_warning:.1f}%")
-        lines.append(f"- 止盈提醒：浮盈 ≥ {self.take_profit_warning:.1f}%")
-        price_hit = (
-            "触发" if abs(change_pct) >= self.price_alert_threshold else "未触发"
-        )
-        lines.append(f"- 当前涨跌幅：{change_pct:+.2f}%（{price_hit}）")
+        # 2. 技术分析（核心指标）
+        kline = data.get("kline_summary")
+        if kline and not kline.get("error"):
+            lines.append("\n【技术分析】")
+            
+            # 趋势判断
+            trend = kline.get("trend", "N/A")
+            ma5 = kline.get("ma5")
+            ma10 = kline.get("ma10")
+            ma20 = kline.get("ma20")
+            
+            lines.append(f"趋势：{trend}")
+            
+            # 均线关系（关键：判断多空）
+            if ma5 and ma10 and ma20:
+                ma_status = ""
+                if ma5 > ma10 > ma20:
+                    ma_status = "多头排列（看涨）"
+                elif ma5 < ma10 < ma20:
+                    ma_status = "空头排列（看跌）"
+                else:
+                    ma_status = "均线交织（震荡）"
+                
+                # 当前价相对均线位置
+                price_vs_ma = ""
+                if current_price > ma5:
+                    price_vs_ma = "站上MA5"
+                elif current_price > ma10:
+                    price_vs_ma = "MA5下方、MA10上方"
+                elif current_price > ma20:
+                    price_vs_ma = "MA10下方、MA20上方"
+                else:
+                    price_vs_ma = "跌破MA20"
+                    
+                lines.append(f"均线：{ma_status}，{price_vs_ma}")
+                lines.append(f"MA5/10/20：{format_num(ma5)} / {format_num(ma10)} / {format_num(ma20)}")
+            
+            # MACD
+            macd_status = kline.get("macd_status", "N/A")
+            macd_cross = kline.get("macd_cross_days")
+            macd_info = f"MACD：{macd_status}"
+            if macd_cross:
+                macd_info += f"（{macd_cross}日前{'金叉' if '金叉' in macd_status else '死叉'}）"
+            lines.append(f"- {macd_info}")
+            
+            # RSI
+            rsi6 = kline.get("rsi6")
+            rsi_status = kline.get("rsi_status")
+            if rsi6 is not None:
+                rsi_hint = "中性"
+                if rsi6 > 80:
+                    rsi_hint = "严重超买"
+                elif rsi6 > 70:
+                    rsi_hint = "超买"
+                elif rsi6 < 20:
+                    rsi_hint = "严重超卖"
+                elif rsi6 < 30:
+                    rsi_hint = "超卖"
+                lines.append(f"RSI(6)：{rsi6:.1f}（{rsi_hint}）")
+            
+            # KDJ
+            kdj_k = kline.get("kdj_k")
+            kdj_d = kline.get("kdj_d")
+            kdj_j = kline.get("kdj_j")
+            kdj_status = kline.get("kdj_status")
+            if kdj_k is not None:
+                kdj_hint = ""
+                if kdj_j is not None:
+                    if kdj_j > 100:
+                        kdj_hint = "，超买注意风险"
+                    elif kdj_j < 0:
+                        kdj_hint = "，超卖关注反弹"
+                lines.append(f"KDJ：K={kdj_k:.1f} D={kdj_d:.1f} J={kdj_j:.1f}（{kdj_status}{kdj_hint}）")
+            
+            # 量能
+            volume_ratio = kline.get("volume_ratio")
+            volume_trend = kline.get("volume_trend")
+            if volume_ratio:
+                vol_hint = "放量" if volume_ratio > 1.5 else ("缩量" if volume_ratio < 0.7 else "正常")
+                lines.append(f"量比：{volume_ratio:.2f}（{vol_hint}）")
+            if volume_trend:
+                lines.append(f"量能趋势：{volume_trend}")
+            
+            # 换手率（A 股专用）
+            pack_for_tr = data.get("signal_pack")
+            if pack_for_tr and pack_for_tr.quote:
+                tr = getattr(pack_for_tr.quote, "turnover_rate", None)
+                if tr is not None:
+                    if tr > 10:
+                        tr_hint = "（异常高换手，活跃）"
+                    elif tr > 5:
+                        tr_hint = "（高换手）"
+                    elif tr < 1:
+                        tr_hint = "（低换手）"
+                    else:
+                        tr_hint = ""
+                    lines.append(f"换手率：{tr:.2f}%{tr_hint}")
+            
+            # 支撑压力位
+            support_s = kline.get("support_s")
+            resistance_s = kline.get("resistance_s")
+            if support_s and resistance_s:
+                # 计算距离
+                dist_support = (current_price - support_s) / current_price * 100
+                dist_resist = (resistance_s - current_price) / current_price * 100
+                lines.append(f"支撑：{format_num(support_s)}（-{dist_support:.1f}%）| 压力：{format_num(resistance_s)}（+{dist_resist:.1f}%）")
+            
+            # 近期涨跌
+            change_5d = kline.get("change_5d")
+            if change_5d is not None:
+                lines.append(f"近5日涨跌：{change_5d:+.1f}%")
 
+        # 3. 资金流向
+        pack = data.get("signal_pack")
+        flow = getattr(pack, "capital_flow", None) if pack else None
+        if isinstance(flow, dict) and flow and not flow.get("error") and flow.get("status"):
+            lines.append("\n【资金流向】")
+            
+            main_inflow = flow.get("main_net_inflow", 0)
+            main_pct = flow.get("main_net_inflow_pct", 0)
+            super_inflow = flow.get("super_net_inflow", 0)
+            big_inflow = flow.get("big_net_inflow", 0)
+            
+            lines.append(f"主力净流入：{format_money(main_inflow)}（{main_pct:+.1f}%）")
+            lines.append(f"超大单：{format_money(super_inflow)}  大单：{format_money(big_inflow)}")
+            
+            trend_5d = flow.get("trend_5d")
+            if trend_5d and trend_5d != "无数据":
+                lines.append(f"5日资金：{trend_5d}")
+
+        # 4. 基本面（季报数据）
+        fund = getattr(pack, "fundamental", None) if pack else None
+        if isinstance(fund, dict) and fund and not fund.get("error"):
+            period = fund.get("period_label", "")
+            lines.append(f"\n【基本面】（{period}）")
+
+            revenue = fund.get("revenue")
+            rev_yoy = fund.get("revenue_yoy")
+            if revenue is not None:
+                rev_str = format_money(revenue)
+                yoy_str = f"（同比{rev_yoy:+.1f}%）" if rev_yoy is not None else ""
+                lines.append(f"营收：{rev_str}{yoy_str}")
+
+            net_profit = fund.get("net_profit")
+            np_yoy = fund.get("net_profit_yoy")
+            if net_profit is not None:
+                np_str = format_money(net_profit)
+                yoy_str = f"（同比{np_yoy:+.1f}%）" if np_yoy is not None else ""
+                lines.append(f"净利润：{np_str}{yoy_str}")
+
+            metrics = []
+            roe = fund.get("roe")
+            gross = fund.get("gross_margin")
+            debt = fund.get("debt_ratio")
+            if roe is not None:
+                metrics.append(f"ROE {roe:.1f}%")
+            if gross is not None:
+                metrics.append(f"毛利率 {gross:.1f}%")
+            if debt is not None:
+                metrics.append(f"负债率 {debt:.1f}%")
+            if metrics:
+                lines.append("  ".join(metrics))
+
+            eps = fund.get("eps")
+            if eps is not None:
+                lines.append(f"EPS：{eps:.3f}元")
+
+        # 5. 新闻（情感标记，按重要性排序）
         symbol_ctx = data.get("symbol_context") or {}
-        quality = (symbol_ctx.get("data_quality") or {})
-        if quality:
-            lines.append(
-                f"- 上下文质量：{quality.get('score', 0)}（实时新闻 {quality.get('realtime_news_count', 0)} 条，扩展新闻 {quality.get('extended_news_count', 0)} 条，历史新闻 {quality.get('history_news_count', 0)} 条）"
-            )
-
         layered_news = symbol_ctx.get("news") or {}
         realtime_news = layered_news.get("realtime") or []
         extended_news = layered_news.get("extended") or []
-        history_news = layered_news.get("history") or []
-        if realtime_news or extended_news or history_news:
-            lines.append("\n## 新闻与事件上下文")
-            chosen = realtime_news or extended_news or history_news
-            for item in chosen[:3]:
-                lines.append(
-                    f"- [{item.get('time')}] {item.get('title')}（{item.get('source')}）"
-                )
-            hist_topic = (layered_news.get("history_topic") or {}).get("summary")
-            if hist_topic:
-                lines.append(f"- 历史新闻主题：{hist_topic}")
+        all_news = realtime_news + extended_news
+        if all_news:
+            all_news_sorted = sorted(all_news, key=lambda x: x.get("importance", 0), reverse=True)
+            lines.append("\n【相关新闻】")
+            for item in all_news_sorted[:3]:
+                sentiment = classify_news_sentiment(item.get("title", ""))
+                lines.append(f"- {sentiment} {item.get('title')}")
 
-        kline_history = symbol_ctx.get("kline_history") or {}
-        if kline_history.get("available"):
-            lines.append("\n## 历史K线背景")
-            lines.append(
-                f"- 历史涨跌：5日{format_num(kline_history.get('ret_5d'), 1)}% / 20日{format_num(kline_history.get('ret_20d'), 1)}% / 60日{format_num(kline_history.get('ret_60d'), 1)}%"
-            )
-            if kline_history.get("volatility_20d") is not None:
-                lines.append(
-                    f"- 波动(20日标准差)：{format_num(kline_history.get('volatility_20d'), 2)}%"
-                )
-            if kline_history.get("breakout_state") and kline_history.get("breakout_state") != "none":
-                lines.append(f"- 突破状态：{kline_history.get('breakout_state')}")
-
-        # K 线和技术指标
-        kline = data.get("kline_summary")
-        if kline and not kline.get("error"):
-            lines.append("\n## 技术分析")
-
-            # 基础趋势
-            lines.append(f"- 趋势：{kline.get('trend', 'N/A')}")
-            lines.append(
-                f"- 近5日：{kline.get('recent_5_up', 0)}涨{5 - kline.get('recent_5_up', 0)}跌"
-            )
-            lines.append(
-                f"- 5日涨幅：{format_num(kline.get('change_5d'))}% | 20日涨幅：{format_num(kline.get('change_20d'))}%"
-            )
-
-            # MACD
-            macd_info = f"MACD：{kline.get('macd_status', 'N/A')}"
-            if kline.get("macd_cross_days"):
-                macd_info += f"（{kline.get('macd_cross_days')}日前）"
-            lines.append(f"- {macd_info}")
-
-            # RSI
-            rsi_status = kline.get("rsi_status")
-            rsi6 = kline.get("rsi6")
-            if rsi_status and rsi6 is not None:
-                lines.append(f"- RSI(6)：{rsi6:.1f}（{rsi_status}）")
-
-            # KDJ
-            kdj_status = kline.get("kdj_status")
-            kdj_k, kdj_d, kdj_j = (
-                kline.get("kdj_k"),
-                kline.get("kdj_d"),
-                kline.get("kdj_j"),
-            )
-            if kdj_status and kdj_k is not None:
-                lines.append(
-                    f"- KDJ：K={kdj_k:.1f} D={kdj_d:.1f} J={kdj_j:.1f}（{kdj_status}）"
-                )
-
-            # 布林带
-            boll_status = kline.get("boll_status")
-            boll_upper, boll_lower = kline.get("boll_upper"), kline.get("boll_lower")
-            if boll_status and boll_upper is not None:
-                lines.append(
-                    f"- 布林带：上轨={format_num(boll_upper)} 下轨={format_num(boll_lower)}（{boll_status}）"
-                )
-
-            # 量能
-            volume_trend = kline.get("volume_trend")
-            volume_ratio = kline.get("volume_ratio")
-            if volume_trend:
-                vol_info = f"量能：{volume_trend}"
-                if volume_ratio:
-                    vol_info += f"（量比={volume_ratio:.2f}）"
-                lines.append(f"- {vol_info}")
-                if volume_ratio:
-                    vol_hit = (
-                        "触发" if volume_ratio >= self.volume_alert_ratio else "未触发"
-                    )
-                    lines.append(f"- 量比阈值判断：{vol_hit}")
-
-            # 均线
-            lines.append(
-                f"- MA5：{format_num(kline.get('ma5'))} | MA10：{format_num(kline.get('ma10'))} | MA20：{format_num(kline.get('ma20'))} | MA60：{format_num(kline.get('ma60'))}"
-            )
-
-        # 资金流向（仅A股，若可用）
-        pack = data.get("signal_pack")
-        flow = getattr(pack, "capital_flow", None) if pack else None
-        if (
-            isinstance(flow, dict)
-            and flow
-            and not flow.get("error")
-            and flow.get("status")
-        ):
-            try:
-                inflow = float(flow.get("main_net_inflow") or 0)
-                inflow_pct = float(flow.get("main_net_inflow_pct") or 0)
-                inflow_str = (
-                    f"{inflow / 1e8:+.2f}亿"
-                    if abs(inflow) >= 1e8
-                    else f"{inflow / 1e4:+.0f}万"
-                )
-                lines.append("\n## 资金面")
-                lines.append(
-                    f"- 资金：{flow.get('status')}，主力净流入{inflow_str}（{inflow_pct:+.1f}%）"
-                )
-                if flow.get("trend_5d") and flow.get("trend_5d") != "无数据":
-                    lines.append(f"- 5日资金：{flow.get('trend_5d')}")
-            except Exception:
-                pass
-
-            # 多级支撑压力
-            support_m, resistance_m = kline.get("support_m"), kline.get("resistance_m")
-            if support_m and resistance_m:
-                lines.append(
-                    f"- 中期支撑：{format_num(support_m)} | 中期压力：{format_num(resistance_m)}"
-                )
-
-            support_s, resistance_s = kline.get("support_s"), kline.get("resistance_s")
-            if support_s and resistance_s:
-                lines.append(
-                    f"- 短期支撑：{format_num(support_s)} | 短期压力：{format_num(resistance_s)}"
-                )
-
-            # K线形态
-            kline_pattern = kline.get("kline_pattern")
-            if kline_pattern:
-                lines.append(f"- K线形态：{kline_pattern}")
-
-            # 振幅
-            amplitude = kline.get("amplitude")
-            amplitude_avg5 = kline.get("amplitude_avg5")
-            if amplitude is not None:
-                amp_info = f"今日振幅：{amplitude:.2f}%"
-                if amplitude_avg5 is not None:
-                    amp_info += f"（5日平均：{amplitude_avg5:.2f}%）"
-                lines.append(f"- {amp_info}")
-
-        # 账户资金情况
-        lines.append(f"\n## 账户资金")
-        lines.append(f"- 总可用资金：{context.portfolio.total_available_funds:.0f} 元")
-        for acc in context.portfolio.accounts:
-            lines.append(f"  - {acc.name}：{acc.available_funds:.0f} 元")
-        constraints = symbol_ctx.get("constraints") or {}
-        if constraints:
-            lines.append(
-                f"- 单票仓位占比：{safe_num(constraints.get('single_position_ratio'), 0) * 100:.1f}%（{constraints.get('risk_budget_hint', 'normal')}）"
-            )
-        memory = symbol_ctx.get("memory") or {}
-        if memory:
-            lines.append(
-                f"- 历史上下文记忆：近{memory.get('window_days', 30)}天质量均值{safe_num(memory.get('avg_quality_score'), 0):.1f}，趋势{memory.get('quality_trend', 'flat')}"
-            )
-            if memory.get("latest_history_topic"):
-                lines.append(f"- 历史记忆主题：{memory.get('latest_history_topic')}")
-
-        # 各账户持仓信息
+        # 6. 持仓情况
         if positions:
-            lines.append(f"\n## 持仓情况（共 {len(positions)} 个账户）")
+            lines.append("\n【持仓情况】")
+            total_qty = 0
             for i, pos in enumerate(positions, 1):
-                cost_price = safe_num(pos.cost_price, 1)
-                pnl_pct = (
-                    (current_price - cost_price) / cost_price * 100
-                    if cost_price > 0
-                    else 0
-                )
-                style_label = style_labels.get(pos.trading_style, "波段")
-                market_value = current_price * pos.quantity
-                # 找到对应账户的可用资金
-                acc_funds = 0
-                for acc in context.portfolio.accounts:
-                    if acc.id == pos.account_id:
-                        acc_funds = acc.available_funds
-                        break
+                cost_price = safe_num(pos.cost_price)
+                pnl_pct = ((current_price - cost_price) / cost_price * 100) if cost_price > 0 else 0
+                qty = safe_num(pos.quantity)
+                total_qty += qty
 
-                lines.append(f"\n### 持仓 {i}：{pos.account_name}")
-                lines.append(f"- 交易风格：{style_label}")
-                lines.append(f"- 成本价：{cost_price:.2f}")
-                lines.append(f"- 持仓量：{pos.quantity} 股")
-                lines.append(f"- 持仓市值：{market_value:.0f} 元")
-                pnl_note = ""
+                lines.append(f"账户{i}：{qty}股，成本{cost_price:.2f}，盈亏{pnl_pct:+.1f}%")
+
+                # 止损止盈提示
                 if pnl_pct <= self.stop_loss_warning:
-                    pnl_note = "（触发止损预警）"
+                    lines.append(f"  ⚠️ 已触发止损预警（{self.stop_loss_warning}%）")
                 elif pnl_pct >= self.take_profit_warning:
-                    pnl_note = "（触发止盈提醒）"
-                lines.append(f"- 浮动盈亏：{pnl_pct:+.1f}%{pnl_note}")
-                lines.append(f"- 账户可用：{acc_funds:.0f} 元")
+                    lines.append(f"  ✅ 已触发止盈提醒（{self.take_profit_warning}%）")
+            lines.append(f"合计：{total_qty}股")
         else:
-            lines.append("\n## 未持仓（仅关注）")
-            lines.append(f"- 可用资金充足，可考虑建仓")
+            lines.append("\n【持仓情况】未持仓")
+            lines.append(f"可用资金：{context.portfolio.total_available_funds:.0f}元")
 
-        # 历史分析上下文（帮助 AI 做出更好的判断）
+        # 7. 历史分析参考（精简）
         daily_analysis = data.get("daily_analysis")
         premarket_analysis = data.get("premarket_analysis")
-
         if daily_analysis or premarket_analysis:
-            lines.append("\n## 历史分析参考")
-
-            if daily_analysis:
-                # 截取与当前股票相关的部分（最多 300 字）
-                content = (
-                    daily_analysis[:300] + "..."
-                    if len(daily_analysis) > 300
-                    else daily_analysis
-                )
-                lines.append(f"\n### 昨日盘后分析摘要")
-                lines.append(content)
-
+            lines.append("\n【历史参考】")
             if premarket_analysis:
-                content = (
-                    premarket_analysis[:300] + "..."
-                    if len(premarket_analysis) > 300
-                    else premarket_analysis
-                )
-                lines.append(f"\n### 今日盘前分析摘要")
-                lines.append(content)
-
-        lines.append("\n请结合技术分析、资金情况和历史分析，给出明确的操作建议。")
+                # 提取关键信息，限制长度
+                brief = premarket_analysis[:150].replace("\n", " ")
+                lines.append(f"盘前观点：{brief}...")
+            elif daily_analysis:
+                brief = daily_analysis[:150].replace("\n", " ")
+                lines.append(f"昨日分析：{brief}...")
 
         user_content = "\n".join(lines)
         return system_prompt, user_content
@@ -493,7 +533,7 @@ class IntradayMonitorAgent(BaseAgent):
             "action_label": "观望",
             "signal": "",
             "reason": "",
-            "should_alert": False,
+            "should_alert": True,  # 所有建议都发送提醒
         }
 
         # 1) Prefer JSON output (structured mode)
@@ -506,14 +546,7 @@ class IntradayMonitorAgent(BaseAgent):
             ).strip()[:20]
             result["signal"] = (obj.get("signal") or "").strip()[:60]
             result["reason"] = (obj.get("reason") or "").strip()[:160]
-            result["should_alert"] = action in {
-                "buy",
-                "add",
-                "reduce",
-                "sell",
-                "alert",
-                "avoid",
-            }
+            result["should_alert"] = True  # 所有建议都发送提醒
             result["triggers"] = (
                 obj.get("triggers") if isinstance(obj.get("triggers"), list) else []
             )
@@ -527,12 +560,7 @@ class IntradayMonitorAgent(BaseAgent):
             )
             return result
 
-        # 检查是否无需提醒
-        if "[无需提醒]" in content:
-            result["should_alert"] = False
-            result["action"] = "hold"
-            result["action_label"] = "持有"
-            return result
+        # 所有建议都发送提醒，不再区分
 
         # 提取建议类型（从全文搜索）
         for label, action in SUGGESTION_TYPES.items():
@@ -594,8 +622,8 @@ class IntradayMonitorAgent(BaseAgent):
             if not clean_content.startswith("[无需提醒]"):
                 result["reason"] = clean_content[:100]
 
-        # 最终 should_alert 判定：只在明确“建仓/加仓/减仓/清仓”时提醒
-        result["should_alert"] = result["action"] in {"buy", "add", "reduce", "sell"}
+        # 所有建议都发送提醒
+        result["should_alert"] = True
         return result
 
     def _try_parse_loose_json(self, text: str) -> dict | None:
@@ -632,32 +660,18 @@ class IntradayMonitorAgent(BaseAgent):
         if not isinstance(obj, dict):
             return None
 
-        # 没有关键字段时不认为是建议 JSON
-        keys = {"action", "action_label", "signal", "reason", "triggers", "invalidations", "risks"}
-        if not any(k in obj for k in keys):
+        # 必须有 action 或 action_label 字段
+        if "action" not in obj and "action_label" not in obj:
             return None
         return obj
 
     def _format_human_readable_content(
         self, stock: StockData, suggestion: dict, raw_content: str
     ) -> str:
-        """当模型返回 JSON 时，生成可读通知内容。"""
+        """生成可读通知内容。"""
         action_label = suggestion.get("action_label") or "观望"
-        signal = suggestion.get("signal") or "无明显新信号"
-        reason = suggestion.get("reason") or "请结合盘面与风控策略审慎判断。"
-        triggers = (
-            suggestion.get("triggers")
-            if isinstance(suggestion.get("triggers"), list)
-            else []
-        )
-        invalidations = (
-            suggestion.get("invalidations")
-            if isinstance(suggestion.get("invalidations"), list)
-            else []
-        )
-        risks = (
-            suggestion.get("risks") if isinstance(suggestion.get("risks"), list) else []
-        )
+        reason = suggestion.get("reason") or ""
+        
         price = (
             f"{stock.current_price:.2f}" if getattr(stock, "current_price", None) else "N/A"
         )
@@ -666,23 +680,18 @@ class IntradayMonitorAgent(BaseAgent):
             f"{stock.name}（{stock.symbol}）",
             f"现价：{price}  涨跌：{chg}",
             f"建议：{action_label}",
-            f"信号：{signal}",
-            f"理由：{reason}",
         ]
-        if triggers:
-            lines.append("触发条件：")
-            lines.extend([f"- {str(x)}" for x in triggers[:3]])
-        if invalidations:
-            lines.append("失效条件：")
-            lines.extend([f"- {str(x)}" for x in invalidations[:3]])
-        if risks:
-            lines.append("风险提示：")
-            lines.extend([f"- {str(x)}" for x in risks[:3]])
-        # 若本次并非纯 JSON，附上简短原文摘要便于核对
-        if not (try_parse_action_json(raw_content) or self._try_parse_loose_json(raw_content)):
+
+        # 理由：优先使用解析出的值，否则从原文提取
+        if reason:
+            lines.append(f"理由：{reason}")
+        else:
+            # 从原文提取关键信息
             brief = re.sub(r"\s+", " ", (raw_content or "").strip())[:200]
             if brief:
-                lines.append(f"备注：{brief}")
+                brief = re.sub(r'^```json\s*|```\s*$|^\s*```\s*$', '', brief)
+                lines.append(f"分析：{brief}")
+
         return "\n".join(lines)
 
     async def analyze(self, context: AgentContext, data: dict) -> AnalysisResult:
@@ -711,23 +720,32 @@ class IntradayMonitorAgent(BaseAgent):
         # 打印完整 prompt 用于调试
         logger.info(f"=== Prompt for {stock.symbol} ===\n{user_content}")
 
-        raw_content = await context.ai_client.chat(system_prompt, user_content)
+        # 可选：附加 K 线截图进行多模态分析
+        screenshot = data.get("screenshot")
+        image_paths: list[str] = []
+        if screenshot and screenshot.exists:
+            image_paths = [screenshot.filepath]
+            logger.info(f"多模态分析：附加 K 线截图 {screenshot.filepath}")
+
+        raw_content = await context.ai_client.chat(
+            system_prompt,
+            user_content,
+            images=image_paths if image_paths else None,
+        )
 
         # 打印 AI 返回结果
         logger.info(f"=== AI Response for {stock.symbol} ===\n{raw_content}")
 
         # 解析操作建议
         suggestion = self._parse_suggestion(raw_content)
-        content = raw_content
         analysis_date = (data.get("timestamp") or "")[:10] or datetime.now().strftime(
             "%Y-%m-%d"
         )
         quality_score = (
             (data.get("symbol_context") or {}).get("data_quality", {}).get("score")
         )
-        # JSON/类 JSON 输出时，统一转换为可读通知文本，避免渠道直接推送原始 JSON
-        if try_parse_action_json(raw_content) or self._try_parse_loose_json(raw_content):
-            content = self._format_human_readable_content(stock, suggestion, raw_content)
+        # 始终使用格式化的可读文本，避免推送原始 JSON
+        content = self._format_human_readable_content(stock, suggestion, raw_content)
 
         # 保存到建议池（包含 prompt 上下文）
         save_suggestion(

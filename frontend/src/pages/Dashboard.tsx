@@ -17,7 +17,7 @@ import {
   Sun,
   Moon,
 } from 'lucide-react'
-import { dashboardApi, discoveryApi } from '@panwatch/api'
+import { dashboardApi, discoveryApi, fetchAPI } from '@panwatch/api'
 import { useLocalStorage } from '@/lib/utils'
 import { Button } from '@panwatch/base-ui/components/ui/button'
 import { Switch } from '@panwatch/base-ui/components/ui/switch'
@@ -25,6 +25,7 @@ import { Select, SelectTrigger, SelectValue, SelectContent, SelectItem } from '@
 import { Onboarding } from '@panwatch/biz-ui/components/onboarding'
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription } from '@panwatch/base-ui/components/ui/dialog'
 import StockInsightModal from '@panwatch/biz-ui/components/stock-insight-modal'
+import { type KlineSummary } from '@panwatch/biz-ui/components/suggestion-badge'
 
 interface MarketIndex {
   symbol: string

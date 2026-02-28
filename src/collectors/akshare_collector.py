@@ -221,6 +221,7 @@ class AkshareCollector(BaseCollector):
                 high_price=item["high_price"],
                 low_price=item["low_price"],
                 prev_close=item["prev_close"],
+                turnover_rate=item.get("turnover_rate"),
                 timestamp=datetime.now(),
             )
             for item in items
