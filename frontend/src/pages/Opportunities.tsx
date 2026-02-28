@@ -74,7 +74,7 @@ const formatMetric = (value: unknown, digits = 1) => {
 }
 
 const DEFAULT_FILTERS = {
-  market: 'ALL' as const,
+  market: 'CN' as const,
   source: 'all' as const,
   holding: 'unheld' as const,
   strategy: 'all',
@@ -624,10 +624,8 @@ export default function OpportunitiesPage() {
           <Select value={market} onValueChange={(v) => setMarket(v as 'ALL' | 'CN' | 'HK' | 'US')}>
             <SelectTrigger className="h-8 text-[12px]"><SelectValue /></SelectTrigger>
             <SelectContent>
-              <SelectItem value="ALL">全部市场</SelectItem>
               <SelectItem value="CN">A股</SelectItem>
-              <SelectItem value="HK">港股</SelectItem>
-              <SelectItem value="US">美股</SelectItem>
+              <SelectItem value="ALL">全部市场</SelectItem>
             </SelectContent>
           </Select>
           <Select value={source} onValueChange={(v) => setSource(v as SourceFilter)}>
