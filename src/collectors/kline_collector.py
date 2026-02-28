@@ -15,7 +15,7 @@ from src.models.market import MarketCode
 logger = logging.getLogger(__name__)
 
 # 腾讯日K线 API
-TENCENT_KLINE_URL = "http://web.ifzq.gtimg.cn/appstock/app/fqkline/get"
+TENCENT_KLINE_URL = "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get"
 EASTMONEY_KLINE_URL = "https://push2his.eastmoney.com/api/qt/stock/kline/get"
 
 
