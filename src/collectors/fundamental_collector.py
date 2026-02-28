@@ -186,19 +186,92 @@ class FundamentalCollector:
 
     @staticmethod
     def _fetch_from_akshare(symbol: str) -> dict:
-        """从 AKShare 采集基本面数据"""
+        """从 AKShare 采集基本面数据。
+
+        使用 stock_financial_analysis_indicator（新浪财经财务分析指标），
+        该接口返回历史数据，非交易时间也可用。
+        备用：stock_financial_abstract（东方财富概要，交易时间才可用）。
+        """
+        # 主接口：stock_financial_analysis_indicator（周末也可用）
         try:
             import akshare as ak
-            df = ak.stock_financial_abstract(symbol=symbol)
-            return FundamentalCollector._parse_df(df)
+            import datetime as _dt
+            start_year = str(_dt.datetime.now().year - 1)  # 取近两年数据，保证有同比
+            df = ak.stock_financial_analysis_indicator(symbol=symbol, start_year=start_year)
+            if df is not None and not df.empty:
+                return FundamentalCollector._parse_analysis_indicator(df)
         except Exception as e:
-            # ETF/指数没有财报数据属正常情况，降为 DEBUG 级别
-            logger.debug("FundamentalCollector %s 获取失败: %s", symbol, e)
-            return {"error": str(e)}
+            logger.debug("FundamentalCollector stock_financial_analysis_indicator %s 失败: %s", symbol, e)
+
+        # 备用接口：stock_financial_abstract（东方财富，交易日可用）
+        try:
+            import akshare as ak
+            df2 = ak.stock_financial_abstract(symbol=symbol)
+            if df2 is not None and not df2.empty:
+                return FundamentalCollector._parse_abstract(df2)
+        except Exception as e:
+            logger.debug("FundamentalCollector stock_financial_abstract %s 失败: %s", symbol, e)
+
+        return {"error": f"基本面采集失败（ETF/指数或接口暂不可用）: {symbol}"}
 
     @staticmethod
-    def _parse_df(df) -> dict:
-        """从 DataFrame 中提取关键指标"""
+    def _parse_analysis_indicator(df) -> dict:
+        """解析 stock_financial_analysis_indicator 返回的 DataFrame。
+
+        列名示例：日期、净资产收益率(%)、销售毛利率(%)、净利润增长率(%)、
+                  主营业务收入增长率(%)、摊薄每股收益(元) 等
+        """
+        if df is None or df.empty:
+            return {"error": "无财务数据"}
+
+        # 按日期排序，取最新两行（用于计算同比）
+        df = df.sort_values("日期", ascending=False).reset_index(drop=True)
+        latest = df.iloc[0]
+
+        # 找去年同季（相差约4行/一年）
+        prev_year = df.iloc[4] if len(df) > 4 else None
+
+        def _g(row, *keys) -> float | None:
+            for k in keys:
+                v = _safe_float(row.get(k))
+                if v is not None:
+                    return v
+            return None
+
+        roe = _g(latest, "净资产收益率(%)", "加权净资产收益率(%)")
+        gross_margin = _g(latest, "销售毛利率(%)")
+        eps = _g(latest, "摊薄每股收益(元)", "加权每股收益(元)")
+        net_profit_yoy = _g(latest, "净利润增长率(%)")
+        revenue_yoy = _g(latest, "主营业务收入增长率(%)")
+
+        # 报告日期
+        report_date = ""
+        if hasattr(latest["日期"], "strftime"):
+            report_date = latest["日期"].strftime("%Y%m%d")
+        else:
+            report_date = str(latest["日期"]).replace("-", "")[:8]
+
+        result: dict = {
+            "report_date": report_date,
+            "period_label": _date_to_period_label(report_date),
+            "cached": False,
+        }
+        if roe is not None:
+            result["roe"] = round(roe, 2)
+        if gross_margin is not None:
+            result["gross_margin"] = round(gross_margin, 1)
+        if eps is not None:
+            result["eps"] = eps
+        if net_profit_yoy is not None:
+            result["net_profit_yoy"] = round(net_profit_yoy, 1)
+        if revenue_yoy is not None:
+            result["revenue_yoy"] = round(revenue_yoy, 1)
+
+        return result
+
+    @staticmethod
+    def _parse_abstract(df) -> dict:
+        """解析 stock_financial_abstract 返回的 DataFrame（备用接口）"""
         if df is None or not hasattr(df, "columns") or df.empty:
             return {"error": "无财务数据（可能是 ETF/指数）"}
 
@@ -209,13 +282,12 @@ class FundamentalCollector:
             if name:
                 indicator_to_idx[name] = i
 
-        # 日期列：从第 3 列开始（索引 2），去掉前两列（选项/指标）
         date_cols = [c for c in df.columns if c not in ("选项", "指标")]
         if len(date_cols) < 5:
             return {"error": "数据列不足"}
 
-        latest_col = date_cols[0]    # 最新季
-        prev_year_col = date_cols[4] if len(date_cols) > 4 else None  # 去年同季
+        latest_col = date_cols[0]
+        prev_year_col = date_cols[4] if len(date_cols) > 4 else None
 
         def get_val(indicator: str, col: str) -> float | None:
             idx = indicator_to_idx.get(indicator)
@@ -223,7 +295,6 @@ class FundamentalCollector:
                 return None
             return _safe_float(df.at[idx, col])
 
-        # 最新季数据
         revenue = get_val("营业总收入", latest_col)
         net_profit = get_val("归母净利润", latest_col)
         roe = get_val("净资产收益率(ROE)", latest_col)
@@ -231,7 +302,6 @@ class FundamentalCollector:
         debt_ratio = get_val("资产负债率", latest_col)
         eps = get_val("基本每股收益", latest_col)
 
-        # 同比增速
         revenue_yoy = None
         net_profit_yoy = None
         if prev_year_col:
@@ -243,7 +313,6 @@ class FundamentalCollector:
             "period_label": _date_to_period_label(latest_col),
             "cached": False,
         }
-
         if revenue is not None:
             result["revenue"] = revenue
         if revenue_yoy is not None:
@@ -260,7 +329,6 @@ class FundamentalCollector:
             result["debt_ratio"] = round(debt_ratio, 1)
         if eps is not None:
             result["eps"] = eps
-
         return result
 
 
