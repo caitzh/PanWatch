@@ -272,12 +272,20 @@ class TechnicalIndicators:
 
 
 def _tencent_symbol(symbol: str, market: MarketCode) -> str:
-    """转换为腾讯 API 格式"""
+    """转换为腾讯 API 格式。
+
+    若 symbol 已包含市场前缀（sh/sz/hk/us），直接返回，避免重复拼接。
+    这样支持传入 "sh000300" 这类完整符号（指数代码不遵循普通股票规则）。
+    """
+    sym = (symbol or "").strip()
+    # 已有完整前缀则直接返回
+    if sym[:2].lower() in ("sh", "sz", "hk", "us"):
+        return sym
     if market == MarketCode.HK:
-        return f"hk{symbol}"
+        return f"hk{sym}"
     if market == MarketCode.US:
-        return f"us{symbol}"
-    return get_cn_prefix(symbol) + symbol
+        return f"us{sym}"
+    return get_cn_prefix(sym) + sym
 
 
 def _calculate_ma(closes: list[float], period: int) -> float | None:

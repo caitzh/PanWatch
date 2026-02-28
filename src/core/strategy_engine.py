@@ -394,7 +394,7 @@ def _classify_market_regime(
 def _fetch_index_regime_data(market: str) -> dict | None:
     """通过全市场指数 K 线估算市场状态（无选择偏差）。
 
-    A 股 (CN) 优先拉取沪深300 (000300)，备选上证指数 (000001)。
+    A 股 (CN) 优先拉取沪深300 (sh000300)，备选上证指数 (sh000001)。
     计算近 20 个交易日的日均涨幅、上涨天数占比和波动率，用于替代
     候选股票样本估计市场状态，消除选择偏差。
 
@@ -407,17 +407,19 @@ def _fetch_index_regime_data(market: str) -> dict | None:
         return None
 
     # 候选指数：沪深300 优先，上证指数备选
-    # A 股指数通过 MarketCode.CN 访问（腾讯 API 使用 sh 前缀）
+    # 注意：000300/000001 是指数代码，cn_symbol.is_cn_sh() 会误判为 SZ
+    # 因此硬编码完整 sh 前缀符号，绕过自动前缀转换
     index_candidates = [
-        ("000300", MarketCode.CN),  # 沪深300 —— 代表性最强
-        ("000001", MarketCode.CN),  # 上证指数 —— 备选
+        ("sh000300", "沪深300"),  # 代表性最强
+        ("sh000001", "上证指数"),  # 备选
     ]
 
-    for symbol, mkt_code in index_candidates:
+    for symbol, index_name in index_candidates:
         try:
-            collector = KlineCollector(mkt_code)
+            collector = KlineCollector(MarketCode.CN)
             klines = collector.get_klines(symbol, days=25)  # 多取几天防节假日
             if not klines or len(klines) < 5:
+                logger.debug("获取 %s (%s) K线不足: n=%d", index_name, symbol, len(klines or []))
                 continue
 
             # 只取最近 20 根 K 线（去除最早几根）
@@ -437,9 +439,9 @@ def _fetch_index_regime_data(market: str) -> dict | None:
             avg_change_pct = sum(daily_changes) / len(daily_changes)
             volatility_pct = _stdev(daily_changes) if len(daily_changes) >= 2 else None
 
-            logger.debug(
-                "指数市场状态 [%s/%s]: breadth=%.1f%% avg=%.3f%% vol=%s n=%d",
-                market, symbol, breadth_up_pct, avg_change_pct,
+            logger.info(
+                "✓ 指数市场状态 [%s]: breadth=%.1f%% avg=%.3f%% vol=%s n=%d",
+                index_name, breadth_up_pct, avg_change_pct,
                 f"{volatility_pct:.3f}" if volatility_pct is not None else "N/A",
                 len(daily_changes),
             )
@@ -448,10 +450,11 @@ def _fetch_index_regime_data(market: str) -> dict | None:
                 "avg_change_pct": avg_change_pct,
                 "volatility_pct": volatility_pct,
                 "index_symbol": symbol,
+                "index_name": index_name,
                 "index_n": len(daily_changes),
             }
         except Exception as exc:  # noqa: BLE001
-            logger.warning("获取指数 %s K 线失败，将降级到候选样本: %s", symbol, exc)
+            logger.warning("获取 %s (%s) K线失败，将降级到候选样本: %s", index_name, symbol, exc)
             continue
 
     return None
